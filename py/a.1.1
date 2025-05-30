@@ -1,0 +1,93 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from scipy.stats import pearsonr
+
+# 1. 데이터 로딩 및 전처리
+# 실제 환경: df = pd.read_csv('your_path.csv')
+# 시뮬레이션 데이터 생성
+np.random.seed(42)
+n = 1000
+
+# 상관관계를 가진 점수 생성
+mu = [66, 69, 68]  # 평균
+sigma = [[232, 180, 185],    # 공분산 행렬
+         [180, 212, 190],
+         [185, 190, 230]]
+
+scores = np.random.multivariate_normal(mu, sigma, n)
+scores = np.clip(scores, 0, 100)  # 0-100 범위로 제한
+
+df = pd.DataFrame({
+    'gender': np.random.choice(['male', 'female'], n, p=[0.484, 0.516]),
+    'math_score': scores[:, 0],
+    'reading_score': scores[:, 1], 
+    'writing_score': scores[:, 2]
+})
+
+print("=== 데이터 기본 정보 ===")
+print(f"데이터 크기: {df.shape}")
+print(f"결측치 개수:\n{df.isnull().sum()}")
+
+# 2. 기술통계량 계산
+score_cols = ['math_score', 'reading_score', 'writing_score']
+desc_stats = df[score_cols].describe()
+
+# 왜도, 첨도 추가
+skewness = df[score_cols].skew()
+kurtosis = df[score_cols].kurtosis()
+
+print("\n=== 기술통계량 ===")
+print(desc_stats)
+print(f"\n왜도:\n{skewness}")
+print(f"\n첨도:\n{kurtosis}")
+
+# 3. 분포 시각화
+fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+# 히스토그램
+for i, col in enumerate(score_cols):
+    axes[0, i].hist(df[col], bins=25, alpha=0.7, color='skyblue', edgecolor='black')
+    axes[0, i].axvline(df[col].mean(), color='red', linestyle='--', 
+                       label=f'평균: {df[col].mean():.1f}')
+    axes[0, i].axvline(df[col].median(), color='green', linestyle='--', 
+                       label=f'중앙값: {df[col].median():.1f}')
+    axes[0, i].set_title(f'{col.replace("_", " ").title()} 히스토그램')
+    axes[0, i].legend()
+
+# 박스플롯
+for i, col in enumerate(score_cols):
+    axes[1, i].boxplot(df[col])
+    axes[1, i].set_title(f'{col.replace("_", " ").title()} 박스플롯')
+    axes[1, i].set_ylabel('점수')
+
+plt.tight_layout()
+plt.show()
+
+# 4. 상관관계 분석
+correlation_matrix = df[score_cols].corr()
+print("\n=== 상관계수 행렬 ===")
+print(correlation_matrix)
+
+# 상관계수 유의성 검정
+pairs = [('math_score', 'reading_score'), 
+         ('math_score', 'writing_score'), 
+         ('reading_score', 'writing_score')]
+
+print("\n=== 상관계수 유의성 검정 ===")
+for pair in pairs:
+    corr, p_val = pearsonr(df[pair[0]], df[pair[1]])
+    print(f"{pair[0]} ↔ {pair[1]}: r={corr:.3f}, p={p_val:.6f}")
+
+# 산점도 행렬
+sns.pairplot(df[score_cols])
+plt.suptitle('점수 간 산점도 행렬', y=1.02)
+plt.show()
+
+# 상관계수 히트맵
+plt.figure(figsize=(8, 6))
+sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', center=0)
+plt.title('과목별 상관계수 히트맵')
+plt.show()
