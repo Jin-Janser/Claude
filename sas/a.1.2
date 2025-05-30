@@ -1,0 +1,95 @@
+/* 데이터 로딩 및 전처리 */
+/* 실제: PROC IMPORT datafile='your_path.csv' out=unemployment dbms=csv replace; */
+
+/* 시뮬레이션 데이터 생성 */
+data unemployment;
+    call streaminit(42);
+    do state_num = 1 to 50;
+        state = cats('State_', state_num);
+        state_base = rand('normal', 5.8, 1.2);
+        
+        do year = 2010 to 2024;
+            do month = 1 to 12;
+                date = mdy(month, 1, year);
+                
+                cycle_effect = 2 * sin(2 * constant('pi') * (year - 2010) / 10);
+                seasonal_effect = 0.5 * sin(2 * constant('pi') * month / 12);
+                noise = rand('normal', 0, 0.8);
+                
+                unemployment_rate = max(1.0, state_base + cycle_effect + seasonal_effect + noise);
+                
+                output;
+            end;
+        end;
+    end;
+    
+    format date mmyys7.;
+    drop state_num state_base cycle_effect seasonal_effect noise;
+run;
+
+/* 이상치 제거 */
+proc means data=unemployment noprint;
+    var unemployment_rate;
+    output out=quartiles q1=q1 q3=q3;
+run;
+
+data _null_;
+    set quartiles;
+    call symputx('q1', q1);
+    call symputx('q3', q3);
+    call symputx('iqr', q3-q1);
+    call symputx('lower_bound', q1 - 1.5*(q3-q1));
+    call symputx('upper_bound', q3 + 1.5*(q3-q1));
+run;
+
+data unemployment_clean;
+    set unemployment;
+    if unemployment_rate >= &lower_bound and unemployment_rate <= &upper_bound;
+run;
+
+/* 분포 적합도 검정 */
+proc univariate data=unemployment_clean;
+    var unemployment_rate;
+    histogram / normal(color=red) weibull(color=blue);
+    qqplot / normal(mu=est sigma=est color=red);
+    output out=fit_stats mean=mean std=std;
+run;
+
+/* 정규성 검정 */
+proc univariate data=unemployment_clean normal;
+    var unemployment_rate;
+run;
+
+/* 캘리포니아 구간 추정 (State_6 사용) */
+proc means data=unemployment_clean(where=(state='State_6')) 
+           mean std n clm alpha=0.05 alpha=0.1 alpha=0.01;
+    var unemployment_rate;
+    title "캘리포니아 주 실업률 구간 추정";
+run;
+
+/* 극단값 확률 계산 */
+data prob_calc;
+    set fit_stats;
+    
+    /* t-분포 근사 (자유도는 표본크기-1) */
+    df = 1000;  /* 충분히 큰 표본 */
+    
+    /* 표준화 */
+    z_10 = (10 - mean) / std;
+    z_5 = (5 - mean) / std;
+    
+    /* 확률 계산 */
+    prob_above_10 = 1 - probt(z_10, df);
+    prob_below_5 = probt(z_5, df);
+    
+    put "실업률 > 10% 확률: " prob_above_10 best12.;
+    put "실업률 < 5% 확률: " prob_below_5 best12.;
+run;
+
+/* 분포 시각화 */
+proc sgplot data=unemployment_clean;
+    histogram unemployment_rate / scale=density;
+    density unemployment_rate / type=normal;
+    density unemployment_rate / type=t;
+    title "실업률 분포 비교";
+run;
