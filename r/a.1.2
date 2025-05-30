@@ -1,0 +1,124 @@
+library(fitdistrplus)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(gridExtra)
+
+# 데이터 로딩 및 전처리
+# 실제: df <- read.csv("your_path.csv")
+set.seed(42)
+dates <- seq.Date(as.Date("2010-01-01"), as.Date("2024-12-01"), by="month")
+states <- paste0("State_", 1:50)
+
+# 시뮬레이션 데이터 생성
+data_list <- list()
+for(state in states) {
+  state_base <- rnorm(1, 5.8, 1.2)
+  for(i in 1:length(dates)) {
+    date <- dates[i]
+    year <- as.numeric(format(date, "%Y"))
+    month <- as.numeric(format(date, "%m"))
+    
+    cycle_effect <- 2 * sin(2 * pi * (year - 2010) / 10)
+    seasonal_effect <- 0.5 * sin(2 * pi * month / 12)
+    noise <- rnorm(1, 0, 0.8)
+    
+    unemployment_rate <- max(1.0, state_base + cycle_effect + seasonal_effect + noise)
+    
+    data_list <- append(data_list, list(data.frame(
+      State = state,
+      Date = date,
+      Unemployment_Rate = unemployment_rate
+    )))
+  }
+}
+
+df <- do.call(rbind, data_list)
+
+# 이상치 제거
+Q1 <- quantile(df$Unemployment_Rate, 0.25)
+Q3 <- quantile(df$Unemployment_Rate, 0.75)
+IQR <- Q3 - Q1
+df <- df[df$Unemployment_Rate >= (Q1 - 1.5*IQR) & df$Unemployment_Rate <= (Q3 + 1.5*IQR), ]
+
+cat("전처리 후 데이터 크기:", nrow(df), "\n")
+cat("실업률 기술통계: 평균=", round(mean(df$Unemployment_Rate), 2), "%, 표준편차=", 
+    round(sd(df$Unemployment_Rate), 2), "%\n")
+
+# 분포 적합도 검정
+unemployment_data <- df$Unemployment_Rate
+
+# 분포 적합
+fit_norm <- fitdist(unemployment_data, "norm")
+fit_exp <- fitdist(unemployment_data - min(unemployment_data) + 0.1, "exp")
+fit_t <- fitdist(unemployment_data, "t", start=list(df=5))
+
+# AIC/BIC 비교
+cat("\n=== 분포 적합도 비교 ===\n")
+cat("정규분포: AIC=", round(fit_norm$aic, 1), ", BIC=", round(fit_norm$bic, 1), "\n")
+cat("지수분포: AIC=", round(fit_exp$aic, 1), ", BIC=", round(fit_exp$bic, 1), "\n")
+cat("t-분포: AIC=", round(fit_t$aic, 1), ", BIC=", round(fit_t$bic, 1), "\n")
+
+# KS 검정
+ks_norm <- ks.test(unemployment_data, "pnorm", fit_norm$estimate[1], fit_norm$estimate[2])
+ks_t <- ks.test(unemployment_data, "pt", fit_t$estimate[1], fit_t$estimate[2], fit_t$estimate[3])
+
+cat("정규분포 KS p-값:", format(ks_norm$p.value, scientific=FALSE), "\n")
+cat("t-분포 KS p-값:", format(ks_t$p.value, scientific=FALSE), "\n")
+
+# Shapiro-Wilk 검정
+sw_test <- shapiro.test(sample(unemployment_data, 5000))
+cat("Shapiro-Wilk p-값:", format(sw_test$p.value, scientific=FALSE), "\n")
+
+# 시각화
+p1 <- ggplot(df, aes(x=Unemployment_Rate)) +
+  geom_histogram(aes(y=..density..), bins=50, alpha=0.7, fill="skyblue") +
+  stat_function(fun=dnorm, args=list(mean=fit_norm$estimate[1], sd=fit_norm$estimate[2]), 
+                color="red", size=1, aes(linetype="정규분포")) +
+  stat_function(fun=function(x) dt((x-fit_t$estimate[2])/fit_t$estimate[3], fit_t$estimate[1])/fit_t$estimate[3], 
+                color="green", size=1, aes(linetype="t-분포")) +
+  labs(title="실업률 분포 비교", x="실업률 (%)", y="밀도") +
+  theme_minimal()
+
+# 캘리포니아 구간 추정
+ca_data <- df[df$State == "State_6", ]$Unemployment_Rate
+ca_mean <- mean(ca_data)
+ca_sd <- sd(ca_data)
+n <- length(ca_data)
+
+confidence_levels <- c(0.90, 0.95, 0.99)
+results <- data.frame()
+
+for(level in confidence_levels) {
+  alpha <- 1 - level
+  t_critical <- qt(1 - alpha/2, df=n-1)
+  
+  # 신뢰구간
+  ci_lower <- ca_mean - t_critical * (ca_sd / sqrt(n))
+  ci_upper <- ca_mean + t_critical * (ca_sd / sqrt(n))
+  
+  # 예측구간
+  pi_lower <- ca_mean - t_critical * ca_sd * sqrt(1 + 1/n)
+  pi_upper <- ca_mean + t_critical * ca_sd * sqrt(1 + 1/n)
+  
+  results <- rbind(results, data.frame(
+    Level = paste0(level*100, "%"),
+    CI_Lower = ci_lower,
+    CI_Upper = ci_upper,
+    PI_Lower = pi_lower,
+    PI_Upper = pi_upper
+  ))
+}
+
+cat("\n=== 캘리포니아 주 실업률 구간 추정 ===\n")
+print(round(results, 2))
+
+# 극단값 확률 계산
+prob_above_10 <- 1 - pt((10 - fit_t$estimate[2])/fit_t$estimate[3], fit_t$estimate[1])
+prob_below_5 <- pt((5 - fit_t$estimate[2])/fit_t$estimate[3], fit_t$estimate[1])
+
+cat("\n=== 극단값 확률 ===\n")
+cat("실업률 > 10% 확률:", round(prob_above_10, 4), paste0("(", round(prob_above_10*100, 2), "%)\n"))
+cat("실업률 < 5% 확률:", round(prob_below_5, 4), paste0("(", round(prob_below_5*100, 2), "%)\n"))
+
+print(p1)
