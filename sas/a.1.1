@@ -1,0 +1,97 @@
+/* 1. 데이터 로딩 및 전처리 */
+/* 실제 환경: PROC IMPORT datafile='your_path.csv' out=students dbms=csv replace; */
+
+/* 시뮬레이션 데이터 생성 */
+data students;
+    call streaminit(42);
+    do i = 1 to 1000;
+        /* 성별 생성 */
+        if rand('uniform') < 0.516 then gender = 'female';
+        else gender = 'male';
+        
+        /* 상관관계를 가진 점수 생성 */
+        array scores[3] math_score reading_score writing_score;
+        array means[3] (66 69 68);
+        
+        /* 간단한 상관구조로 점수 생성 */
+        base_ability = rand('normal', 0, 1);
+        math_score = max(0, min(100, 66 + 15*rand('normal') + 8*base_ability));
+        reading_score = max(0, min(100, 69 + 14*rand('normal') + 10*base_ability));
+        writing_score = max(0, min(100, 68 + 15*rand('normal') + 9*base_ability));
+        
+        output;
+    end;
+    drop i base_ability;
+run;
+
+/* 데이터 기본 정보 */
+title "=== 데이터 기본 정보 ===";
+proc contents data=students;
+run;
+
+proc means data=students n nmiss;
+    var math_score reading_score writing_score;
+    title "결측치 확인";
+run;
+
+/* 2. 기술통계량 계산 */
+title "=== 기술통계량 ===";
+proc means data=students n mean median std min max q1 q3 skewness kurtosis;
+    var math_score reading_score writing_score;
+run;
+
+/* 3. 분포 시각화 */
+title "=== 분포 시각화 ===";
+
+/* 히스토그램 */
+proc sgplot data=students;
+    histogram math_score / bins=25;
+    density math_score;
+    refline / axis=x value=66 lineattrs=(color=red pattern=dash) 
+              label="평균" labelloc=inside;
+    title "수학 점수 분포";
+run;
+
+proc sgplot data=students;
+    histogram reading_score / bins=25;
+    density reading_score;
+    refline / axis=x value=69 lineattrs=(color=red pattern=dash) 
+              label="평균" labelloc=inside;
+    title "읽기 점수 분포";
+run;
+
+proc sgplot data=students;
+    histogram writing_score / bins=25;
+    density writing_score;
+    refline / axis=x value=68 lineattrs=(color=red pattern=dash) 
+              label="평균" labelloc=inside;
+    title "쓰기 점수 분포";
+run;
+
+/* 박스플롯 */
+proc sgplot data=students;
+    vbox math_score;
+    title "수학 점수 박스플롯";
+run;
+
+proc sgplot data=students;
+    vbox reading_score;
+    title "읽기 점수 박스플롯";
+run;
+
+proc sgplot data=students;
+    vbox writing_score;
+    title "쓰기 점수 박스플롯";
+run;
+
+/* 4. 상관관계 분석 */
+title "=== 상관관계 분석 ===";
+proc corr data=students plots=matrix;
+    var math_score reading_score writing_score;
+run;
+
+/* 산점도 행렬 */
+proc sgscatter data=students;
+    matrix math_score reading_score writing_score;
+    title "점수 간 산점도 행렬";
+run;
