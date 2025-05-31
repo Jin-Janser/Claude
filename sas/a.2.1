@@ -1,0 +1,84 @@
+/* 1. 데이터 로드 및 기본 설정 */
+proc import datafile="train.csv" out=housing dbms=csv replace;
+    getnames=yes;
+run;
+
+/* 2. 결측치 처리 - MICE */
+proc mi data=housing out=housing_imputed nimpute=5 seed=42;
+    var GrLivArea OverallQual TotalBsmtSF GarageCars YearBuilt YearRemodAdd;
+run;
+
+/* 범주형 변수 최빈값 대체 */
+proc stdize data=housing_imputed out=housing_clean reponly method=mode;
+    var Neighborhood MSZoning;
+run;
+
+/* 3. 파생변수 생성 */
+data housing_features;
+    set housing_clean;
+    RemodelAge = YearRemodAdd - YearBuilt;
+    TotalSF = GrLivArea + TotalBsmtSF;
+run;
+
+/* 4. Target Encoding (수동 구현) */
+proc sql;
+    create table neighborhood_encoding as
+    select Neighborhood, mean(SalePrice) as Neighborhood_Enc
+    from housing_features
+    group by Neighborhood;
+    
+    create table mszone_encoding as
+    select MSZoning, mean(SalePrice) as MSZoning_Enc
+    from housing_features
+    group by MSZoning;
+quit;
+
+proc sql;
+    create table housing_encoded as
+    select h.*, n.Neighborhood_Enc, m.MSZoning_Enc
+    from housing_features h
+    left join neighborhood_encoding n on h.Neighborhood = n.Neighborhood
+    left join mszone_encoding m on h.MSZoning = m.MSZoning;
+quit;
+
+/* 5. VIF 검사 및 다중공선성 제거 */
+proc reg data=housing_encoded;
+    model SalePrice = GrLivArea OverallQual TotalBsmtSF GarageCars 
+                      Neighborhood_Enc MSZoning_Enc RemodelAge TotalSF / vif;
+    output out=reg_output p=predicted r=residual;
+run;
+
+/* 6. 단계적 회귀분석 */
+proc glmselect data=housing_encoded;
+    model SalePrice = GrLivArea OverallQual TotalBsmtSF GarageCars 
+                      Neighborhood_Enc MSZoning_Enc RemodelAge TotalSF
+          / selection=stepwise(select=sl) slentry=0.01 slstay=0.01;
+run;
+
+/* 7. 정규화 회귀 (Ridge/Lasso 근사) */
+proc glmselect data=housing_encoded plots=all;
+    model SalePrice = GrLivArea OverallQual TotalBsmtSF GarageCars 
+                      Neighborhood_Enc / selection=lasso(adaptive);
+    output out=lasso_output predicted=pred_lasso;
+run;
+
+/* 8. 최종 모델 진단 */
+proc reg data=housing_encoded plots(maxpoints=none)=
+    (residuals(smooth) qqplot cooksd leverage dffits dfbetas);
+    model SalePrice = GrLivArea OverallQual TotalBsmtSF GarageCars Neighborhood_Enc;
+    output out=final_output p=predicted r=residual 
+           student=studentized cookd=cooksd h=leverage;
+run;
+
+/* 9. 교차검증 */
+proc glmselect data=housing_encoded;
+    model SalePrice = GrLivArea OverallQual TotalBsmtSF GarageCars Neighborhood_Enc
+          / selection=none;
+    partition fraction(validate=0.3);
+    output out=cv_output predicted=pred_cv;
+run;
+
+/* 10. 모델 성능 지표 계산 */
+proc means data=final_output;
+    var SalePrice predicted residual;
+run;
