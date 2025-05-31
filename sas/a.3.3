@@ -1,0 +1,207 @@
+/* =============================================================================
+   타이타닉 생존분석 - SAS 코드
+   ============================================================================= */
+
+/* 1. 데이터 로딩 및 전처리 */
+/* 파일 경로를 실제 경로로 수정하세요 */
+proc import datafile="C:\path\to\train.csv" 
+    out=titanic_raw
+    dbms=csv
+    replace;
+    getnames=yes;
+run;
+
+/* 데이터 전처리 */
+data titanic_clean;
+    set titanic_raw;
+    
+    /* 결측치 처리 */
+    if missing(Age) then Age = 28;  /* 중앙값으로 대체 */
+    if missing(Embarked) then Embarked = 'S';  /* 최빈값으로 대체 */
+    if missing(Fare) then Fare = 14.4542;  /* 중앙값으로 대체 */
+    
+    /* 범주형 변수 인코딩 */
+    if Sex = 'male' then Sex_num = 0;
+    else if Sex = 'female' then Sex_num = 1;
+    
+    if Embarked = 'C' then Embarked_num = 1;
+    else if Embarked = 'Q' then Embarked_num = 2;
+    else if Embarked = 'S' then Embarked_num = 3;
+    
+    /* 생존분석을 위한 시간 변수 생성 */
+    /* 타이타닉의 경우 모든 사건이 동일한 시점에 발생했으므로 time=1로 설정 */
+    time = 1;
+    
+    /* 변수 라벨링 */
+    label 
+        Survived = "생존여부 (0=사망, 1=생존)"
+        Sex_num = "성별 (0=남성, 1=여성)"
+        Age = "나이"
+        Pclass = "객실등급"
+        SibSp = "형제자매/배우자 수"
+        Parch = "부모/자녀 수"
+        Fare = "운임"
+        time = "관찰시간";
+run;
+
+/* 데이터 요약 통계 */
+proc means data=titanic_clean n nmiss mean std min max;
+    var Age Fare SibSp Parch;
+    title "연속형 변수 요약통계";
+run;
+
+proc freq data=titanic_clean;
+    tables Survived Pclass Sex / nocum;
+    title "범주형 변수 빈도표";
+run;
+
+/* =============================================================================
+   2. Kaplan-Meier 생존 곡선 및 로그-순위 검정
+   ============================================================================= */
+
+/* 성별별 생존 곡선 */
+ods graphics on;
+proc lifetest data=titanic_clean plots=survival(atrisk=0 to 2 by 1);
+    time time*Survived(0);  /* Survived=0이면 검열(사망) */
+    strata Sex;
+    title "성별별 Kaplan-Meier 생존 곡선";
+run;
+
+/* 객실 등급별 생존 곡선 */
+proc lifetest data=titanic_clean plots=survival(atrisk=0 to 2 by 1);
+    time time*Survived(0);
+    strata Pclass;
+    title "객실 등급별 Kaplan-Meier 생존 곡선";
+run;
+
+/* 성별과 객실등급 조합별 생존 곡선 */
+proc lifetest data=titanic_clean plots=survival(atrisk=0 to 2 by 1);
+    time time*Survived(0);
+    strata Sex Pclass;
+    title "성별×객실등급별 Kaplan-Meier 생존 곡선";
+run;
+
+/* =============================================================================
+   3. Cox Proportional Hazards 모델
+   ============================================================================= */
+
+/* Cox 비례위험 모델 구축 */
+proc phreg data=titanic_clean;
+    class Pclass (ref='3') Sex_num (ref='0') Embarked_num (ref='3');
+    model time*Survived(0) = Pclass Sex_num Age SibSp Parch Fare / 
+          rl ties=efron;
+    
+    /* Hazard Ratio 계산 */
+    hazardratio 'HR for Gender' Sex_num / diff=ref;
+    hazardratio 'HR for Class' Pclass / diff=ref;
+    
+    title "Cox 비례위험 모델 결과";
+    
+    /* 결과를 데이터셋으로 저장 */
+    ods output ParameterEstimates = cox_estimates;
+    ods output HazardRatios = hr_table;
+run;
+
+/* Cox 모델 결과 표시 */
+proc print data=hr_table;
+    title "Hazard Ratio 요약표";
+run;
+
+/* =============================================================================
+   4. 비례위험 가정 검증 (Schoenfeld 잔차)
+   ============================================================================= */
+
+proc phreg data=titanic_clean;
+    class Pclass (ref='3') Sex_num (ref='0') Embarked_num (ref='3');
+    model time*Survived(0) = Pclass Sex_num Age SibSp Parch Fare / 
+          ties=efron;
+    
+    /* 비례위험 가정 검증 */
+    assess ph / resample;
+    title "비례위험 가정 검증 - Schoenfeld 잔차";
+run;
+
+/* =============================================================================
+   5. 특정 프로필 생존 확률 예측
+   ============================================================================= */
+
+/* 30세 여성 1등석 승객 프로필 생성 */
+data predict_profile;
+    Pclass = 1;
+    Sex_num = 1;  /* 여성 */
+    Age = 30;
+    SibSp = 0;
+    Parch = 0;
+    Fare = 50;  /* 1등석 평균 운임 */
+    Embarked_num = 3;  /* Southampton */
+run;
+
+/* Cox 모델을 이용한 생존 확률 예측 */
+proc phreg data=titanic_clean;
+    class Pclass (ref='3') Sex_num (ref='0') Embarked_num (ref='3');
+    model time*Survived(0) = Pclass Sex_num Age SibSp Parch Fare / 
+          ties=efron;
+    
+    /* 기준선 생존 함수 계산 */
+    baseline out=baseline_surv survival=survival / 
+             covariates=predict_profile;
+    
+    title "30세 여성 1등석 승객의 생존 확률 예측";
+run;
+
+/* 예측 결과 시각화 */
+proc sgplot data=baseline_surv;
+    series x=time y=survival / lineattrs=(thickness=2 color=blue);
+    xaxis label="시간" grid;
+    yaxis label="생존 확률" grid;
+    title "30세 여성 1등석 승객의 예측 생존 곡선";
+run;
+
+/* =============================================================================
+   6. 추가 분석: 생존율 요약 통계
+   ============================================================================= */
+
+/* 그룹별 생존율 계산 */
+proc sql;
+    create table survival_rates as
+    select 
+        Sex,
+        Pclass,
+        count(*) as Total_Count,
+        sum(Survived) as Survivors,
+        calculated Survivors / calculated Total_Count as Survival_Rate format=percent8.1
+    from titanic_clean
+    group by Sex, Pclass
+    order by Sex, Pclass;
+quit;
+
+proc print data=survival_rates;
+    title "성별×객실등급별 생존율";
+run;
+
+/* 연령대별 생존율 분석 */
+data titanic_age_group;
+    set titanic_clean;
+    if Age < 18 then Age_Group = '소아 (<18)';
+    else if Age < 65 then Age_Group = '성인 (18-64)';
+    else Age_Group = '고령 (65+)';
+run;
+
+proc sql;
+    create table age_survival as
+    select 
+        Age_Group,
+        Sex,
+        count(*) as Total_Count,
+        sum(Survived) as Survivors,
+        calculated Survivors / calculated Total_Count as Survival_Rate format=percent8.1
+    from titanic_age_group
+    group by Age_Group, Sex
+    order by Age_Group, Sex;
+quit;
+
+proc print data=age_survival;
+    title "연령대별 성별 생존율";
+run;
+
+ods graphics off;
