@@ -1,0 +1,244 @@
+# 필요한 라이브러리 로드
+library(tidyverse)     # 데이터 조작 및 시각화
+library(factoextra)    # PCA 시각화
+library(cluster)       # 군집 분석 및 실루엣 계수
+library(fpc)           # Dunn 지수 계산
+library(corrplot)      # 상관관계 플롯
+library(gridExtra)     # 다중 플롯 배치
+
+# 1. 데이터 로딩 및 기본 탐색
+data(iris)
+str(iris)
+summary(iris)
+
+# 결측치 확인
+sum(is.na(iris))
+cat("결측치 개수:", sum(is.na(iris)), "\n")
+
+# 2. 이상치 탐지 및 처리 (IQR × 1.5 기준)
+numeric_vars <- c("Sepal.Length", "Sepal.Width", "Petal.Length", "Petal.Width")
+
+# 이상치 탐지 함수
+detect_outliers <- function(x) {
+  Q1 <- quantile(x, 0.25)
+  Q3 <- quantile(x, 0.75)
+  IQR <- Q3 - Q1
+  lower <- Q1 - 1.5 * IQR
+  upper <- Q3 + 1.5 * IQR
+  return(which(x < lower | x > upper))
+}
+
+# 각 변수별 이상치 확인
+outliers_list <- list()
+for(var in numeric_vars) {
+  outliers_list[[var]] <- detect_outliers(iris[[var]])
+}
+
+# 전체 이상치 행 식별
+all_outliers <- unique(unlist(outliers_list))
+cat("이상치가 있는 행:", length(all_outliers), "개\n")
+print(all_outliers)
+
+# 이상치 제거 (실제로는 매우 적을 것으로 예상)
+iris_clean <- iris[-all_outliers, ]
+cat("이상치 제거 후 관측치 수:", nrow(iris_clean), "\n")
+
+# 3. 데이터 표준화 (Z-점수)
+iris_scaled <- iris_clean
+iris_scaled[, numeric_vars] <- scale(iris_clean[, numeric_vars])
+
+# 표준화 전후 비교
+cat("\n=== 표준화 전 기술통계량 ===\n")
+print(round(sapply(iris_clean[numeric_vars], function(x) c(mean=mean(x), sd=sd(x))), 3))
+
+cat("\n=== 표준화 후 기술통계량 ===\n")
+print(round(sapply(iris_scaled[numeric_vars], function(x) c(mean=mean(x), sd=sd(x))), 3))
+
+# 4. 주성분 분석 (PCA) 수행
+pca_result <- prcomp(iris_scaled[, numeric_vars], center = FALSE, scale. = FALSE)
+
+# PCA 결과 요약
+pca_summary <- summary(pca_result)
+eigenvalues <- pca_result$sdev^2
+explained_var <- eigenvalues / sum(eigenvalues)
+cumulative_var <- cumsum(explained_var)
+
+# PCA 결과표 생성
+pca_table <- data.frame(
+  PC = paste0("PC", 1:4),
+  Eigenvalue = round(eigenvalues, 3),
+  Proportion = round(explained_var, 3),
+  Cumulative = round(cumulative_var, 3)
+)
+
+cat("\n=== PCA 결과표 ===\n")
+print(pca_table)
+
+# 변수 기여도 (Loadings)
+loadings_table <- as.data.frame(pca_result$rotation[, 1:2])
+loadings_table$Variable <- rownames(loadings_table)
+cat("\n=== 변수 기여도 (PC1, PC2) ===\n")
+print(round(loadings_table, 3))
+
+# 5. 스크리 플롯 생성
+scree_plot <- fviz_eig(pca_result, addlabels = TRUE, ylim = c(0, 80)) +
+  labs(title = "Scree Plot - Iris PCA",
+       x = "Principal Components",
+       y = "% of Variance Explained") +
+  theme_minimal()
+
+# 6. PCA Biplot (품종별 색상 구분)
+biplot <- fviz_pca_biplot(pca_result,
+                         col.ind = iris_clean$Species,
+                         palette = c("#E7B800", "#2E9FDF", "#FC4E07"),
+                         addEllipses = TRUE,
+                         label = "var",
+                         col.var = "black",
+                         repel = TRUE,
+                         title = "PCA Biplot - Iris Dataset") +
+  theme_minimal()
+
+# 7. K-means 군집 분석 (k=3)
+set.seed(123)
+kmeans_result <- kmeans(iris_scaled[, numeric_vars], centers = 3, nstart = 25)
+iris_scaled$kmeans_cluster <- as.factor(kmeans_result$cluster)
+
+# 8. 계층적 군집 분석 (Ward 연결법)
+dist_matrix <- dist(iris_scaled[, numeric_vars], method = "euclidean")
+hclust_result <- hclust(dist_matrix, method = "ward.D2")
+iris_scaled$hclust_cluster <- as.factor(cutree(hclust_result, k = 3))
+
+# 9. 실루엣 계수 계산
+sil_kmeans <- silhouette(kmeans_result$cluster, dist_matrix)
+sil_hclust <- silhouette(as.numeric(iris_scaled$hclust_cluster), dist_matrix)
+
+avg_sil_kmeans <- mean(sil_kmeans[, "sil_width"])
+avg_sil_hclust <- mean(sil_hclust[, "sil_width"])
+
+# 10. Dunn 지수 계산
+dunn_kmeans <- dunn(dist_matrix, kmeans_result$cluster)
+dunn_hclust <- dunn(dist_matrix, as.numeric(iris_scaled$hclust_cluster))
+
+# 11. 군집 분석 결과표
+cluster_comparison <- data.frame(
+  Method = c("K-means", "Hierarchical"),
+  Silhouette_Score = round(c(avg_sil_kmeans, avg_sil_hclust), 3),
+  Dunn_Index = round(c(dunn_kmeans, dunn_hclust), 3)
+)
+
+cat("\n=== 군집 분석 결과 비교 ===\n")
+print(cluster_comparison)
+
+# 12. PCA 점수 계산 및 시각화 데이터 준비
+pca_scores <- as.data.frame(pca_result$x[, 1:2])
+pca_scores$Species <- iris_clean$Species
+pca_scores$KMeans <- iris_scaled$kmeans_cluster
+pca_scores$Hierarchical <- iris_scaled$hclust_cluster
+
+# 13. 시각화
+
+# 13.1 표준화 전후 분포 비교
+original_long <- iris_clean[numeric_vars] %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value") %>%
+  mutate(Type = "Original")
+
+scaled_long <- as.data.frame(iris_scaled[numeric_vars]) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value") %>%
+  mutate(Type = "Standardized")
+
+distribution_plot <- bind_rows(original_long, scaled_long) %>%
+  ggplot(aes(x = Value, fill = Type)) +
+  geom_histogram(bins = 20, alpha = 0.7, position = "identity") +
+  facet_wrap(~Variable, scales = "free") +
+  labs(title = "Distribution Comparison: Original vs Standardized",
+       x = "Value", y = "Frequency") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Original" = "steelblue", "Standardized" = "darkred"))
+
+# 13.2 원본 품종별 PCA 시각화
+species_pca_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = Species)) +
+  geom_point(size = 3, alpha = 0.7) +
+  stat_ellipse(type = "norm", linetype = 2) +
+  labs(title = "PCA: True Species Labels",
+       x = paste0("PC1 (", round(explained_var[1]*100, 1), "%)"),
+       y = paste0("PC2 (", round(explained_var[2]*100, 1), "%)")) +
+  theme_minimal() +
+  scale_color_manual(values = c("setosa" = "#E7B800", "versicolor" = "#2E9FDF", "virginica" = "#FC4E07"))
+
+# 13.3 K-means 군집 결과 PCA 시각화
+kmeans_pca_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = KMeans)) +
+  geom_point(size = 3, alpha = 0.7) +
+  stat_ellipse(type = "norm", linetype = 2) +
+  labs(title = paste0("K-means Clustering (Silhouette: ", round(avg_sil_kmeans, 3), ")"),
+       x = paste0("PC1 (", round(explained_var[1]*100, 1), "%)"),
+       y = paste0("PC2 (", round(explained_var[2]*100, 1), "%)"),
+       color = "Cluster") +
+  theme_minimal() +
+  scale_color_manual(values = c("1" = "#FF6B6B", "2" = "#4ECDC4", "3" = "#45B7D1"))
+
+# 13.4 계층적 군집 결과 PCA 시각화
+hclust_pca_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = Hierarchical)) +
+  geom_point(size = 3, alpha = 0.7) +
+  stat_ellipse(type = "norm", linetype = 2) +
+  labs(title = paste0("Hierarchical Clustering (Silhouette: ", round(avg_sil_hclust, 3), ")"),
+       x = paste0("PC1 (", round(explained_var[1]*100, 1), "%)"),
+       y = paste0("PC2 (", round(explained_var[2]*100, 1), "%)"),
+       color = "Cluster") +
+  theme_minimal() +
+  scale_color_manual(values = c("1" = "#FF8C42", "2" = "#6A994E", "3" = "#BC4749"))
+
+# 13.5 실루엣 플롯
+sil_kmeans_plot <- fviz_silhouette(sil_kmeans) +
+  labs(title = "Silhouette Plot - K-means")
+
+sil_hclust_plot <- fviz_silhouette(sil_hclust) +
+  labs(title = "Silhouette Plot - Hierarchical")
+
+# 13.6 덴드로그램
+dendrogram_plot <- fviz_dend(hclust_result, k = 3, 
+                            cex = 0.5, 
+                            palette = "jco",
+                            rect = TRUE) +
+  labs(title = "Hierarchical Clustering Dendrogram")
+
+# 모든 플롯 출력
+print(scree_plot)
+print(biplot)
+print(distribution_plot)
+print(species_pca_plot)
+print(kmeans_pca_plot)
+print(hclust_pca_plot)
+print(sil_kmeans_plot)
+print(sil_hclust_plot)
+print(dendrogram_plot)
+
+# 14. 종합 분석 결과 출력
+cat("\n" + "="*50)
+cat("\n           종합 분석 결과")
+cat("\n" + "="*50)
+
+cat("\n\n1. 데이터 전처리:")
+cat("\n   - 원본 관측치:", nrow(iris), "개")
+cat("\n   - 이상치 제거 후:", nrow(iris_clean), "개")
+cat("\n   - 결측치: 없음")
+
+cat("\n\n2. PCA 결과:")
+cat("\n   - PC1 설명 분산:", round(explained_var[1]*100, 1), "%")
+cat("\n   - PC2 설명 분산:", round(explained_var[2]*100, 1), "%")
+cat("\n   - PC1+PC2 누적 분산:", round(cumulative_var[2]*100, 1), "%")
+
+cat("\n\n3. 군집 분석 결과:")
+cat("\n   - K-means 실루엣 계수:", round(avg_sil_kmeans, 3))
+cat("\n   - K-means Dunn 지수:", round(dunn_kmeans, 3))
+cat("\n   - 계층적 실루엣 계수:", round(avg_sil_hclust, 3))
+cat("\n   - 계층적 Dunn 지수:", round(dunn_hclust, 3))
+
+# 15. 군집과 실제 품종 비교
+confusion_kmeans <- table(iris_clean$Species, kmeans_result$cluster)
+confusion_hclust <- table(iris_clean$Species, cutree(hclust_result, k = 3))
+
+cat("\n\n4. 군집 vs 실제 품종 비교:")
+cat("\n   K-means 혼동행렬:\n")
+print(confusion_kmeans)
+cat("\n   계층적 군집 혼동행렬:\n")
+print(confusion_hclust)
