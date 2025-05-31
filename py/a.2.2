@@ -1,0 +1,118 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statsmodels.tsa.seasonal import STL
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from pmdarima import auto_arima
+from arch import arch_model
+from arch.unitroot import ArchLMTest
+import warnings
+warnings.filterwarnings('ignore')
+
+# 1. 데이터 로드 및 전처리
+# 파일 경로 수정 필요: 'DJI_weekly.csv'
+df = pd.read_csv('DJI_weekly.csv', parse_dates=['Date'], index_col='Date')
+df = df.asfreq('W-MON')  # 주간 주기 설정
+
+# 결측치 선형 보간
+df['Adj Close'] = df['Adj Close'].interpolate(method='linear')
+
+# 로그수익률 계산
+df['log_return'] = np.log(df['Adj Close'] / df['Adj Close'].shift(1))
+df = df.dropna()
+
+# IQR 기준 이상치 제거
+Q1, Q3 = df['log_return'].quantile([0.25, 0.75])
+IQR = Q3 - Q1
+mask = (df['log_return'] >= Q1 - 1.5*IQR) & (df['log_return'] <= Q3 + 1.5*IQR)
+df_clean = df[mask]
+
+print(f"원본 데이터: {len(df)}개")
+print(f"정제 후 데이터: {len(df_clean)}개")
+print(f"제거된 이상치: {len(df) - len(df_clean)}개")
+
+# 2. STL 분해 (52주 주기)
+stl = STL(df_clean['log_return'], period=52, robust=True)
+stl_result = stl.fit()
+
+# STL 분해 시각화
+fig, axes = plt.subplots(4, 1, figsize=(12, 10))
+stl_result.observed.plot(ax=axes[0], title='Original')
+stl_result.trend.plot(ax=axes[1], title='Trend')
+stl_result.seasonal.plot(ax=axes[2], title='Seasonal')
+stl_result.resid.plot(ax=axes[3], title='Residual')
+plt.tight_layout()
+plt.show()
+
+# 3. ARIMA 모델링
+# ACF/PACF 플롯
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+plot_acf(df_clean['log_return'], ax=ax1, lags=40)
+plot_pacf(df_clean['log_return'], ax=ax2, lags=40)
+plt.tight_layout()
+plt.show()
+
+# 최적 ARIMA 모델 탐색
+arima_model = auto_arima(df_clean['log_return'], 
+                        seasonal=False, 
+                        ic='bic',
+                        stepwise=True,
+                        suppress_warnings=True)
+print(f"최적 ARIMA 모델: {arima_model.order}")
+print(f"AIC: {arima_model.aic():.2f}, BIC: {arima_model.bic():.2f}")
+
+# 8주 예측
+forecast, conf_int = arima_model.predict(n_periods=8, return_conf_int=True)
+print("\n8주 예측 결과:")
+for i in range(8):
+    print(f"Week {i+1}: {forecast[i]:.4f} [{conf_int[i,0]:.4f}, {conf_int[i,1]:.4f}]")
+
+# ARIMA 잔차 진단
+residuals = arima_model.resid()
+fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10))
+
+# 잔차 플롯
+ax1.plot(residuals)
+ax1.set_title('ARIMA Residuals')
+
+# ACF 플롯
+plot_acf(residuals, ax=ax2, lags=30)
+
+# Q-Q 플롯
+from scipy import stats
+stats.probplot(residuals, dist="norm", plot=ax3)
+ax3.set_title('Q-Q Plot')
+
+plt.tight_layout()
+plt.show()
+
+# 4. ARCH-LM 검정
+arch_lm = ArchLMTest(residuals, lags=5)
+print(f"\nARCH-LM 검정:")
+print(f"검정통계량: {arch_lm.stat:.2f}")
+print(f"p-value: {arch_lm.pvalue:.4f}")
+
+# 5. GARCH(1,1) 모델
+garch_model = arch_model(df_clean['log_return'], 
+                        vol='GARCH', 
+                        p=1, q=1, 
+                        dist='StudentsT')
+garch_fit = garch_model.fit(disp='off')
+print(f"\nGARCH(1,1) 모델 결과:")
+print(garch_fit.summary())
+
+# 지속성 계수 계산
+alpha = garch_fit.params['alpha[1]']
+beta = garch_fit.params['beta[1]']
+persistence = alpha + beta
+print(f"\n지속성 계수 (α+β): {persistence:.3f}")
+
+# GARCH 조건부 변동성 시각화
+plt.figure(figsize=(12, 6))
+plt.plot(df_clean.index, garch_fit.conditional_volatility, 
+         color='red', linewidth=1)
+plt.title('GARCH(1,1) Conditional Volatility')
+plt.ylabel('Volatility')
+plt.xlabel('Date')
+plt.show()
