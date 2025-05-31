@@ -1,0 +1,402 @@
+/* =============================================================================
+   비모수적 방법론을 활용한 소득 분포 분석 - SAS 코드
+   ============================================================================= */
+
+/* 1. 라이브러리 설정 및 옵션 */
+options nodate nonumber;
+libname mylib "C:\temp"; /* 경로를 실제 경로로 수정 */
+
+/* 2. 가상 BLS 소득 데이터 생성 */
+data income_data;
+    call streaminit(123); /* 재현 가능한 결과를 위한 시드 설정 */
+    
+    do i = 1 to 5000;
+        /* 기본 인구통계학적 변수 생성 */
+        if rand('uniform') < 0.52 then gender = 'Male';
+        else gender = 'Female';
+        
+        temp = rand('uniform');
+        if temp < 0.12 then education = 'Less than HS';
+        else if temp < 0.42 then education = 'High School';
+        else if temp < 0.80 then education = 'Bachelor';
+        else education = 'Advanced';
+        
+        age = max(18, min(65, 42 + 12*rand('normal')));
+        experience = max(0, min(age-18, 15 + 8*rand('normal')));
+        
+        temp2 = rand('uniform');
+        if temp2 < 0.63 then race = 'White';
+        else if temp2 < 0.75 then race = 'Black';
+        else if temp2 < 0.93 then race = 'Hispanic';
+        else race = 'Other';
+        
+        temp3 = rand('uniform');
+        if temp3 < 0.18 then region = 'Northeast';
+        else if temp3 < 0.56 then region = 'South';
+        else if temp3 < 0.77 then region = 'Midwest';
+        else region = 'West';
+        
+        /* 소득 생성 (현실적인 분포) */
+        base_income = 45000;
+        
+        /* 교육 수준별 소득 배율 */
+        if education = 'Less than HS' then edu_mult = 0.7;
+        else if education = 'High School' then edu_mult = 1.0;
+        else if education = 'Bachelor' then edu_mult = 1.5;
+        else edu_mult = 2.2;
+        
+        /* 성별 소득 격차 */
+        if gender = 'Male' then gender_mult = 1.0;
+        else gender_mult = 0.82;
+        
+        /* 지역별 차이 */
+        if region = 'Northeast' then region_mult = 1.15;
+        else if region = 'West' then region_mult = 1.12;
+        else if region = 'Midwest' then region_mult = 0.95;
+        else region_mult = 0.98;
+        
+        /* 최종 소득 계산 */
+        income = base_income * edu_mult * gender_mult * region_mult * 
+                (1 + experience * 0.015) * exp(0.35*rand('normal'));
+        
+        /* 소득 하한선 및 상한선 설정 */
+        income = max(20000, min(500000, income));
+        
+        output;
+    end;
+    
+    keep gender education age experience race region income;
+run;
+
+/* 소수의 결측치 생성 */
+data income_data;
+    set income_data;
+    if rand('uniform') < 0.02 then income = .;
+run;
+
+/* 결측치 제거 */
+data income_clean;
+    set income_data;
+    where income ne .;
+run;
+
+/* 3. 기본 통계 요약 */
+proc means data=income_clean n mean std min max;
+    var income age experience;
+    title "소득 데이터 기본 통계";
+run;
+
+proc freq data=income_clean;
+    tables gender education race region;
+    title "범주형 변수 빈도표";
+run;
+
+/* =============================================================================
+   4. 커널 밀도 추정 및 소득 분포 분석
+   ============================================================================= */
+
+/* 4.1 전체 소득 분포의 커널 밀도 추정 */
+ods graphics on;
+proc kde data=income_clean;
+    univar income / plots=densityoverlay out=kde_overall;
+    title "전체 소득 분포의 커널 밀도 추정";
+run;
+
+/* 4.2 성별 그룹별 커널 밀도 추정 */
+proc kde data=income_clean;
+    univar income / plots=densityoverlay out=kde_gender;
+    by gender;
+    title "성별 소득 분포의 커널 밀도 추정";
+run;
+
+/* 4.3 교육 수준별 커널 밀도 추정 */
+proc sort data=income_clean;
+    by education;
+run;
+
+proc kde data=income_clean;
+    univar income / plots=densityoverlay out=kde_education;
+    by education;
+    title "교육 수준별 소득 분포의 커널 밀도 추정";
+run;
+
+/* 4.4 그룹별 커널 밀도 비교 시각화 */
+proc sgplot data=income_clean;
+    density income / group=gender;
+    title "성별 소득 분포 커널 밀도 비교";
+    xaxis label="연간 소득 (USD)";
+    yaxis label="밀도";
+run;
+
+proc sgplot data=income_clean;
+    density income / group=education;
+    title "교육 수준별 소득 분포 커널 밀도 비교";
+    xaxis label="연간 소득 (USD)";
+    yaxis label="밀도";
+run;
+
+/* =============================================================================
+   5. 소득 불평등 지수 계산
+   ============================================================================= */
+
+/* 5.1 지니 계수 계산 매크로 */
+%macro gini_calc(dataset, income_var, output_dataset);
+    proc sort data=&dataset;
+        by &income_var;
+    run;
+    
+    data &output_dataset (keep=gini);
+        set &dataset end=eof nobs=nobs;
+        retain ginisum 0 sum 0 ipt 0;
+        
+        ipt = ipt + 1;
+        sum = sum + &income_var;
+        ginisum = ginisum + (2*ipt - (nobs+1)) * &income_var;
+        
+        if eof then do;
+            gini = ginisum / ((nobs-1) * sum);
+            output;
+        end;
+    run;
+%mend;
+
+/* 5.2 앳킨슨 지수 계산 매크로 */
+%macro atkinson_calc(dataset, income_var, epsilon, output_dataset);
+    proc means data=&dataset noprint;
+        var &income_var;
+        output out=temp_stats mean=mean_income n=n;
+    run;
+    
+    data _null_;
+        set temp_stats;
+        call symputx('mean_inc', mean_income);
+        call symputx('n_obs', n);
+    run;
+    
+    data temp_atkinson;
+        set &dataset;
+        if &income_var > 0;
+        
+        %if &epsilon = 1 %then %do;
+            log_income = log(&income_var);
+        %end;
+        %else %do;
+            power_income = (&income_var)**(1-&epsilon);
+        %end;
+    run;
+    
+    %if &epsilon = 1 %then %do;
+        proc means data=temp_atkinson noprint;
+            var log_income;
+            output out=temp_geom mean=mean_log;
+        run;
+        
+        data &output_dataset (keep=atkinson);
+            set temp_geom;
+            geometric_mean = exp(mean_log);
+            atkinson = 1 - geometric_mean / &mean_inc;
+            output;
+        run;
+    %end;
+    %else %do;
+        proc means data=temp_atkinson noprint;
+            var power_income;
+            output out=temp_power mean=mean_power;
+        run;
+        
+        data &output_dataset (keep=atkinson);
+            set temp_power;
+            ede = (mean_power)**(1/(1-&epsilon));
+            atkinson = 1 - ede / &mean_inc;
+            output;
+        run;
+    %end;
+%mend;
+
+/* 5.3 불평등 지수 계산 */
+%gini_calc(income_clean, income, gini_result);
+%atkinson_calc(income_clean, income, 0.5, atkinson_result);
+
+/* 결과 출력 */
+proc print data=gini_result;
+    title "지니 계수 (전체 인구)";
+    format gini 6.4;
+run;
+
+proc print data=atkinson_result;
+    title "앳킨슨 지수 (epsilon=0.5, 전체 인구)";
+    format atkinson 6.4;
+run;
+
+/* 5.4 그룹별 불평등 지수 계산 */
+/* 성별 그룹별 */
+proc sort data=income_clean;
+    by gender;
+run;
+
+data male_data female_data;
+    set income_clean;
+    if gender = 'Male' then output male_data;
+    else output female_data;
+run;
+
+%gini_calc(male_data, income, gini_male);
+%gini_calc(female_data, income, gini_female);
+%atkinson_calc(male_data, income, 0.5, atkinson_male);
+%atkinson_calc(female_data, income, 0.5, atkinson_female);
+
+/* 5.5 부트스트랩을 통한 신뢰구간 추정 */
+%macro bootstrap_gini(dataset, income_var, n_boot, alpha);
+    data boot_results;
+        length gini 8;
+        do boot_sample = 1 to &n_boot;
+            do i = 1 to 1000; /* 부트스트랩 샘플 크기 */
+                obs_num = ceil(rand('uniform') * %eval(&n_obs));
+                set &dataset point=obs_num;
+                output;
+            end;
+            
+            /* 각 부트스트랩 샘플에 대해 지니 계수 계산 */
+            call execute('%gini_calc(work.boot_temp, &income_var, work.boot_gini_temp);');
+        end;
+        stop;
+    run;
+%mend;
+
+/* =============================================================================
+   6. 분위 회귀 분석
+   ============================================================================= */
+
+/* 6.1 교육 수준을 수치 변수로 변환 */
+data income_analysis;
+    set income_clean;
+    
+    if education = 'Less than HS' then education_years = 10;
+    else if education = 'High School' then education_years = 12;
+    else if education = 'Bachelor' then education_years = 16;
+    else education_years = 20;
+    
+    if gender = 'Male' then male = 1;
+    else male = 0;
+run;
+
+/* 6.2 OLS 회귀 분석 */
+proc reg data=income_analysis;
+    model income = education_years experience male;
+    title "OLS 회귀 분석 결과";
+run;
+
+/* 6.3 분위 회귀 분석 (10분위, 50분위, 90분위) */
+ods graphics on;
+proc quantreg data=income_analysis;
+    model income = education_years experience male / 
+          quantile=(0.1 0.5 0.9) plots=all;
+    title "분위 회귀 분석 결과";
+run;
+
+/* 6.4 분위별 회귀계수 비교 */
+proc quantreg data=income_analysis;
+    model income = education_years experience male / 
+          quantile=(0.1 0.25 0.5 0.75 0.9);
+    ods output ParameterEstimates=quantile_estimates;
+    title "분위별 회귀계수 추정";
+run;
+
+/* =============================================================================
+   7. 추가 분석 및 시각화
+   ============================================================================= */
+
+/* 7.1 소득 분위별 기본 통계 */
+proc univariate data=income_clean noprint;
+    var income;
+    output out=income_percentiles 
+           pctlpts=10 25 50 75 90 95 99
+           pctlpre=p;
+run;
+
+proc print data=income_percentiles;
+    title "소득 분위별 통계";
+run;
+
+/* 7.2 교육 수준별 소득 박스플롯 */
+proc sgplot data=income_clean;
+    vbox income / category=education;
+    title "교육 수준별 소득 분포 (박스플롯)";
+    yaxis label="연간 소득 (USD)";
+run;
+
+/* 7.3 성별 × 교육 수준별 평균 소득 */
+proc means data=income_clean;
+    class gender education;
+    var income;
+    output out=mean_income mean=mean_income;
+    title "성별 × 교육 수준별 평균 소득";
+run;
+
+proc sgplot data=mean_income;
+    where _type_ = 3; /* 교차분류 결과만 */
+    series x=education y=mean_income / group=gender markers;
+    title "성별 × 교육 수준별 평균 소득 추이";
+    xaxis display=(nolabel);
+    yaxis label="평균 소득 (USD)";
+run;
+
+/* 7.4 분위 회귀 계수 시각화 */
+data plot_quantiles;
+    set quantile_estimates;
+    where parameter ne 'Intercept';
+run;
+
+proc sgplot data=plot_quantiles;
+    series x=quantile y=estimate / group=parameter markers;
+    title "분위별 회귀계수 변화";
+    xaxis label="분위수";
+    yaxis label="회귀계수 추정값";
+run;
+
+/* =============================================================================
+   8. 결과 요약 출력
+   ============================================================================= */
+
+/* 8.1 전체 결과 요약 */
+proc sql;
+    create table summary_stats as
+    select 
+        'Overall' as Group,
+        count(*) as N,
+        mean(income) as Mean_Income format=dollar12.0,
+        std(income) as Std_Income format=dollar12.0,
+        min(income) as Min_Income format=dollar12.0,
+        max(income) as Max_Income format=dollar12.0
+    from income_clean
+    
+    union all
+    
+    select 
+        gender as Group,
+        count(*) as N,
+        mean(income) as Mean_Income format=dollar12.0,
+        std(income) as Std_Income format=dollar12.0,
+        min(income) as Min_Income format=dollar12.0,
+        max(income) as Max_Income format=dollar12.0
+    from income_clean
+    group by gender
+    
+    union all
+    
+    select 
+        education as Group,
+        count(*) as N,
+        mean(income) as Mean_Income format=dollar12.0,
+        std(income) as Std_Income format=dollar12.0,
+        min(income) as Min_Income format=dollar12.0,
+        max(income) as Max_Income format=dollar12.0
+    from income_clean
+    group by education;
+quit;
+
+proc print data=summary_stats;
+    title "그룹별 소득 통계 요약";
+run;
+
+ods graphics off;
