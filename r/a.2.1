@@ -1,0 +1,191 @@
+library(tidyverse)
+library(mice)
+library(car)        # VIF 계산
+library(MASS)       # 단계적 선택법
+library(glmnet)     # Ridge/Lasso
+library(caret)      # 교차검증
+library(ggplot2)
+library(gridExtra)
+
+# 1. 데이터 로드 및 전처리
+load_preprocess_data <- function() {
+  # 실제 환경에서는 파일 경로 수정
+  tryCatch({
+    df <- read.csv("train.csv", stringsAsFactors = FALSE)
+  }, error = function(e) {
+    # 샘플 데이터 생성
+    set.seed(42)
+    n <- 1460
+    df <- data.frame(
+      Id = 1:n,
+      SalePrice = exp(rnorm(n, 12, 0.4)),
+      GrLivArea = rnorm(n, 1500, 500),
+      OverallQual = sample(1:10, n, replace = TRUE),
+      TotalBsmtSF = rnorm(n, 1000, 400),
+      GarageCars = sample(0:3, n, replace = TRUE),
+      YearBuilt = sample(1900:2009, n, replace = TRUE),
+      YearRemodAdd = sample(1950:2009, n, replace = TRUE),
+      Neighborhood = sample(c("NAmes", "CollgCr", "OldTown"), n, replace = TRUE),
+      MSZoning = sample(c("RL", "RM", "FV"), n, replace = TRUE)
+    )
+  })
+  
+  return(df)
+}
+
+# 2. MICE 결측치 처리
+handle_missing_mice <- function(df) {
+  numeric_vars <- names(select_if(df, is.numeric))
+  numeric_vars <- numeric_vars[!numeric_vars %in% c("Id", "SalePrice")]
+  
+  categorical_vars <- names(select_if(df, is.character))
+  
+  # MICE 대체
+  mice_result <- mice(df[numeric_vars], m = 5, method = 'pmm', seed = 42)
+  df[numeric_vars] <- complete(mice_result)
+  
+  # 범주형 최빈값 대체
+  for(col in categorical_vars) {
+    mode_val <- names(sort(table(df[[col]]), decreasing = TRUE))[1]
+    df[[col]][is.na(df[[col]])] <- mode_val
+  }
+  
+  return(df)
+}
+
+# 3. Target Encoding
+target_encoding <- function(df, cat_vars, target = "SalePrice") {
+  for(col in cat_vars) {
+    encoding_map <- df %>%
+      group_by(!!sym(col)) %>%
+      summarise(mean_target = mean(!!sym(target), na.rm = TRUE))
+    
+    df[[paste0(col, "_Enc")]] <- encoding_map$mean_target[
+      match(df[[col]], encoding_map[[col]])
+    ]
+  }
+  return(df)
+}
+
+# 4. VIF 기반 변수 선택
+remove_high_vif <- function(df, vars, threshold = 5) {
+  while(TRUE) {
+    model_formula <- paste("~", paste(vars, collapse = " + "))
+    model_matrix <- model.matrix(as.formula(model_formula), data = df)
+    
+    if(ncol(model_matrix) <= 2) break
+    
+    vif_values <- vif(lm(SalePrice ~ ., data = df[c("SalePrice", vars)]))
+    
+    if(max(vif_values) <= threshold) break
+    
+    # 가장 높은 VIF 변수 제거
+    high_vif_var <- names(which.max(vif_values))
+    vars <- vars[vars != high_vif_var]
+    
+    if(length(vars) <= 1) break
+  }
+  
+  return(vars)
+}
+
+# 5. 정규화 모델 비교
+compare_regularization <- function(X, y) {
+  # 10-fold CV 설정
+  train_control <- trainControl(
+    method = "cv",
+    number = 10,
+    savePredictions = TRUE
+  )
+  
+  # Ridge 회귀
+  ridge_model <- train(
+    x = X, y = y,
+    method = "ridge",
+    trControl = train_control,
+    tuneLength = 10
+  )
+  
+  # Lasso 회귀  
+  lasso_model <- train(
+    x = X, y = y,
+    method = "lasso",
+    trControl = train_control,
+    tuneLength = 10
+  )
+  
+  # ElasticNet
+  elasticnet_model <- train(
+    x = X, y = y,
+    method = "glmnet",
+    trControl = train_control,
+    tuneLength = 10
+  )
+  
+  results <- list(
+    Ridge = ridge_model,
+    Lasso = lasso_model,
+    ElasticNet = elasticnet_model
+  )
+  
+  return(results)
+}
+
+# 6. 모델 진단 플롯
+create_diagnostic_plots <- function(model, data) {
+  # 부분회귀 플롯
+  p1 <- avPlots(model, main = "부분회귀 플롯")
+  
+  # Q-Q 플롯
+  p2 <- qqPlot(model, main = "잔차 Q-Q 플롯")
+  
+  # 등분산성 플롯
+  fitted_vals <- fitted(model)
+  residuals_vals <- residuals(model)
+  
+  p3 <- ggplot(data = data.frame(fitted = fitted_vals, resid = residuals_vals),
+               aes(x = fitted, y = resid)) +
+    geom_point(alpha = 0.6) +
+    geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    labs(x = "적합값", y = "잔차", title = "잔차 vs 적합값") +
+    theme_minimal()
+  
+  return(list(p1, p2, p3))
+}
+
+# 메인 실행 함수
+main_analysis <- function() {
+  # 데이터 준비
+  df <- load_preprocess_data()
+  df <- handle_missing_mice(df)
+  
+  # 파생변수 생성
+  df$RemodelAge <- df$YearRemodAdd - df$YearBuilt
+  df$TotalSF <- df$GrLivArea + df$TotalBsmtSF
+  
+  # Target Encoding
+  categorical_vars <- c("Neighborhood", "MSZoning")
+  df <- target_encoding(df, categorical_vars)
+  
+  # 변수 선택
+  feature_vars <- c("GrLivArea", "OverallQual", "TotalBsmtSF", "GarageCars",
+                    "Neighborhood_Enc", "MSZoning_Enc", "RemodelAge", "TotalSF")
+  
+  # VIF 기반 변수 선택
+  selected_vars <- remove_high_vif(df, feature_vars)
+  
+  # 최종 모델 구축
+  final_formula <- paste("SalePrice ~", paste(selected_vars, collapse = " + "))
+  final_model <- lm(as.formula(final_formula), data = df)
+  
+  # 모델 요약
+  print(summary(final_model))
+  
+  # 진단 플롯
+  diagnostic_plots <- create_diagnostic_plots(final_model, df)
+  
+  return(list(model = final_model, data = df, plots = diagnostic_plots))
+}
+
+# 실행
+results <- main_analysis()
