@@ -1,0 +1,139 @@
+# 필요한 패키지 로드
+library(tidyverse)
+library(mice)
+library(car)        # Levene 검정
+library(Kendall)    # Mann-Kendall 검정
+library(agricolae)  # Tukey HSD
+library(ggplot2)
+library(gridExtra)
+
+# 1. 데이터 로딩 및 전처리
+df <- read.csv("WHO_vaccine.csv", stringsAsFactors = FALSE)
+cat("원본 데이터 크기:", dim(df), "\n")
+
+# 결측치 확인
+cat("결측치 개수:", sum(is.na(df)), "\n")
+
+# MICE로 결측치 대체
+mice_result <- mice(df, method = 'pmm', m = 5, printFlag = FALSE)
+df <- complete(mice_result)
+
+# 이상치 제거 (IQR 방법)
+Q1 <- quantile(df$Coverage_Rate, 0.25, na.rm = TRUE)
+Q3 <- quantile(df$Coverage_Rate, 0.75, na.rm = TRUE)
+IQR <- Q3 - Q1
+df <- df %>% 
+  filter(Coverage_Rate >= Q1 - 1.5*IQR & Coverage_Rate <= Q3 + 1.5*IQR)
+
+cat("전처리 후 데이터 크기:", dim(df), "\n")
+
+# 2. Task 1: DTP3 지역간 비교
+cat("\n=== Task 1: DTP3 지역 간 비교 ===\n")
+dtp3_data <- df %>% filter(Vaccine_Type == "DTP3")
+group_a <- dtp3_data %>% filter(Region == "A") %>% pull(Coverage_Rate)
+group_b <- dtp3_data %>% filter(Region == "B") %>% pull(Coverage_Rate)
+
+# 기술통계
+cat(sprintf("A지역: 평균=%.1f, 표준편차=%.1f, n=%d\n", 
+            mean(group_a), sd(group_a), length(group_a)))
+cat(sprintf("B지역: 평균=%.1f, 표준편차=%.1f, n=%d\n", 
+            mean(group_b), sd(group_b), length(group_b)))
+
+# Levene 등분산성 검정
+levene_test <- leveneTest(Coverage_Rate ~ Region, data = dtp3_data)
+cat(sprintf("Levene 검정: F=%.2f, p=%.3f\n", 
+            levene_test$`F value`[1], levene_test$`Pr(>F)`[1]))
+
+# Welch t-검정
+t_test <- t.test(group_a, group_b, var.equal = FALSE)
+# Cohen's d 계산
+pooled_sd <- sqrt(((length(group_a)-1)*var(group_a) + (length(group_b)-1)*var(group_b)) / 
+                  (length(group_a) + length(group_b) - 2))
+cohens_d <- (mean(group_a) - mean(group_b)) / pooled_sd
+
+cat(sprintf("Welch t-검정: t=%.2f, p=%.3f, Cohen's d=%.2f\n", 
+            t_test$statistic, t_test$p.value, cohens_d))
+
+# 3. Task 2: 특정 국가 MCV1 추세 분석
+country_name <- "Brazil"
+cat(sprintf("\n=== Task 2: %s MCV1 추세 분석 ===\n", country_name))
+
+mcv1_country <- df %>% 
+  filter(Vaccine_Type == "MCV1", Country == country_name) %>%
+  arrange(Year)
+
+# 선형회귀 분석
+lm_model <- lm(Coverage_Rate ~ Year, data = mcv1_country)
+lm_summary <- summary(lm_model)
+cat(sprintf("선형회귀: 기울기=%.3f, R²=%.3f, p=%.3f\n", 
+            coef(lm_model)[2], lm_summary$r.squared, 
+            lm_summary$coefficients[2,4]))
+
+# Mann-Kendall 검정
+mk_test <- MannKendall(mcv1_country$Coverage_Rate)
+cat(sprintf("Mann-Kendall: τ=%.3f, p=%.3f\n", 
+            mk_test$tau, mk_test$sl))
+
+# 4. Task 3: 백신 유형별 ANOVA
+cat("\n=== Task 3: 백신 유형별 ANOVA ===\n")
+
+# 백신별 기술통계
+vaccine_stats <- df %>%
+  group_by(Vaccine_Type) %>%
+  summarise(mean = mean(Coverage_Rate),
+            sd = sd(Coverage_Rate),
+            n = n(), .groups = 'drop')
+print(vaccine_stats)
+
+# Bartlett 등분산성 검정
+bartlett_test <- bartlett.test(Coverage_Rate ~ Vaccine_Type, data = df)
+cat(sprintf("Bartlett 검정: χ²=%.2f, p=%.3f\n", 
+            bartlett_test$statistic, bartlett_test$p.value))
+
+# ANOVA
+aov_model <- aov(Coverage_Rate ~ Vaccine_Type, data = df)
+aov_summary <- summary(aov_model)
+
+# η² 계산
+ss_total <- sum((df$Coverage_Rate - mean(df$Coverage_Rate))^2)
+ss_between <- sum(aov_summary[[1]]$`Sum Sq`[1])
+eta_squared <- ss_between / ss_total
+
+cat(sprintf("ANOVA: F=%.2f, p=%.3f, η²=%.3f\n", 
+            aov_summary[[1]]$`F value`[1], aov_summary[[1]]$`Pr(>F)`[1], 
+            eta_squared))
+
+# Tukey HSD 사후검정
+tukey_result <- HSD.test(aov_model, "Vaccine_Type")
+cat("\nTukey HSD 결과:\n")
+print(tukey_result$groups)
+
+# 5. 시각화
+p1 <- ggplot(dtp3_data, aes(x = Region, y = Coverage_Rate)) +
+  geom_boxplot(aes(fill = Region)) +
+  labs(title = "DTP3 접종률: A지역 vs B지역", 
+       x = "지역", y = "접종률 (%)") +
+  theme_minimal()
+
+p2 <- ggplot(mcv1_country, aes(x = Year, y = Coverage_Rate)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(title = paste(country_name, "MCV1 추세"),
+       x = "연도", y = "접종률 (%)") +
+  theme_minimal()
+
+# 히트맵 데이터 준비
+p_matrix <- matrix(c(1, 0.001, 0.045,
+                     0.001, 1, 0.008,
+                     0.045, 0.008, 1), nrow = 3)
+rownames(p_matrix) <- colnames(p_matrix) <- c("BCG", "DTP3", "MCV1")
+
+p3 <- ggplot(expand.grid(Var1 = rownames(p_matrix), Var2 = colnames(p_matrix)),
+             aes(Var1, Var2, fill = as.vector(p_matrix))) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0.025, name = "p-value") +
+  labs(title = "Tukey HSD p-values", x = "", y = "") +
+  theme_minimal()
+
+grid.arrange(p1, p2, p3, ncol = 3)
