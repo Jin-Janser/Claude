@@ -1,0 +1,240 @@
+# 필요한 라이브러리 로드
+library(survival)      # 생존분석
+library(survminer)     # 생존분석 시각화
+library(dplyr)         # 데이터 전처리
+library(ggplot2)       # 시각화
+library(VIM)           # 결측치 시각화
+
+# 데이터 로딩 (파일 경로 수정 필요)
+# titanic <- read.csv("train.csv", stringsAsFactors = FALSE)
+# 예시 데이터 생성 (실제 사용 시 위 코드 사용)
+set.seed(123)
+titanic <- data.frame(
+  PassengerId = 1:891,
+  Survived = rbinom(891, 1, 0.38),
+  Pclass = sample(1:3, 891, replace = TRUE, prob = c(0.24, 0.21, 0.55)),
+  Sex = sample(c("male", "female"), 891, replace = TRUE, prob = c(0.65, 0.35)),
+  Age = ifelse(runif(891) < 0.2, NA, rnorm(891, 30, 12)),
+  SibSp = rpois(891, 0.5),
+  Parch = rpois(891, 0.4),
+  Fare = rexp(891, 1/32),
+  Embarked = sample(c("S", "C", "Q"), 891, replace = TRUE, prob = c(0.72, 0.19, 0.09))
+)
+
+# 데이터 구조 확인
+str(titanic)
+summary(titanic)
+
+# 결측치 패턴 시각화
+VIM::aggr(titanic, col = c('navyblue', 'red'), numbers = TRUE, sortVars = TRUE)
+
+# 결측치 처리
+titanic <- titanic %>%
+  mutate(
+    # Age 결측치를 중앙값으로 대체
+    Age = ifelse(is.na(Age), median(Age, na.rm = TRUE), Age),
+    # Embarked 결측치를 최빈값으로 대체
+    Embarked = ifelse(is.na(Embarked) | Embarked == "", 
+                     names(sort(table(Embarked), decreasing = TRUE))[1], 
+                     Embarked),
+    # 범주형 변수 변환
+    Sex = factor(Sex, levels = c("male", "female")),
+    Pclass = factor(Pclass),
+    Embarked = factor(Embarked),
+    # 생존분석을 위한 변수 생성 (모든 관찰이 동일한 시점에서 이루어짐)
+    time = 1,  # 모든 승객이 동일한 시점에서 관찰됨
+    status = Survived  # 1: 생존, 0: 사망 (이벤트 발생)
+  )
+
+print("전처리 완료:")
+print(paste("총 관측치:", nrow(titanic)))
+print(paste("결측치 제거 후:", sum(complete.cases(titanic))))
+
+# 성별별 Kaplan-Meier 생존 곡선
+km_sex <- survfit(Surv(time, status) ~ Sex, data = titanic)
+
+# 성별별 생존 곡선 시각화
+p1 <- ggsurvplot(km_sex, 
+                 data = titanic,
+                 pval = TRUE,
+                 conf.int = TRUE,
+                 risk.table = TRUE,
+                 risk.table.col = "strata",
+                 legend.labs = c("Male", "Female"),
+                 palette = c("#E7B800", "#2E9FDF"),
+                 title = "Kaplan-Meier Survival Curves by Sex",
+                 xlab = "Time",
+                 ylab = "Survival Probability")
+
+print(p1)
+
+# 성별 간 로그-순위 검정
+logrank_sex <- survdiff(Surv(time, status) ~ Sex, data = titanic)
+print("성별 간 로그-순위 검정 결과:")
+print(logrank_sex)
+
+# 객실 등급별 Kaplan-Meier 생존 곡선
+km_pclass <- survfit(Surv(time, status) ~ Pclass, data = titanic)
+
+# 객실 등급별 생존 곡선 시각화
+p2 <- ggsurvplot(km_pclass,
+                 data = titanic,
+                 pval = TRUE,
+                 conf.int = TRUE,
+                 risk.table = TRUE,
+                 risk.table.col = "strata",
+                 legend.labs = c("1st Class", "2nd Class", "3rd Class"),
+                 palette = c("#D55E00", "#56B4E9", "#009E73"),
+                 title = "Kaplan-Meier Survival Curves by Passenger Class",
+                 xlab = "Time",
+                 ylab = "Survival Probability")
+
+print(p2)
+
+# 객실 등급 간 로그-순위 검정
+logrank_pclass <- survdiff(Surv(time, status) ~ Pclass, data = titanic)
+print("객실 등급 간 로그-순위 검정 결과:")
+print(logrank_pclass)
+
+# 로그-순위 검정 결과 요약표
+logrank_results <- data.frame(
+  Comparison = c("Sex (Male vs Female)", "Passenger Class (1st vs 2nd vs 3rd)"),
+  Chi_square = c(logrank_sex$chisq, logrank_pclass$chisq),
+  df = c(length(logrank_sex$n) - 1, length(logrank_pclass$n) - 1),
+  p_value = c(1 - pchisq(logrank_sex$chisq, length(logrank_sex$n) - 1),
+              1 - pchisq(logrank_pclass$chisq, length(logrank_pclass$n) - 1))
+)
+
+print("로그-순위 검정 결과 요약:")
+print(logrank_results)
+
+# Cox 모델 구축
+cox_model <- coxph(Surv(time, status) ~ Pclass + Sex + Age + SibSp + Parch + Fare, 
+                   data = titanic)
+
+# 모델 결과 출력
+print("Cox Proportional Hazards 모델 결과:")
+summary(cox_model)
+
+# Hazard Ratio 및 신뢰구간 계산
+hr_results <- data.frame(
+  Variable = names(coef(cox_model)),
+  Coefficient = coef(cox_model),
+  HR = exp(coef(cox_model)),
+  Lower_95CI = exp(confint(cox_model)[,1]),
+  Upper_95CI = exp(confint(cox_model)[,2]),
+  p_value = summary(cox_model)$coefficients[,"Pr(>|z|)"]
+)
+
+print("Hazard Ratio 결과표:")
+print(round(hr_results, 4))
+
+# 비례위험 가정 검증 (Schoenfeld 잔차)
+ph_test <- cox.zph(cox_model)
+print("비례위험 가정 검증 (Schoenfeld 잔차):")
+print(ph_test)
+
+# Schoenfeld 잔차 시각화
+par(mfrow = c(2, 3))
+plot(ph_test)
+par(mfrow = c(1, 1))
+
+# 전역 비례위험 가정 검정 결과
+global_test <- ph_test$table[nrow(ph_test$table), ]
+print(paste("전역 비례위험 가정 검정 p-값:", round(global_test["p"], 4)))
+
+if(global_test["p"] > 0.05) {
+  print("비례위험 가정이 만족됩니다 (p > 0.05)")
+} else {
+  print("비례위험 가정이 위반될 가능성이 있습니다 (p ≤ 0.05)")
+}
+
+# 30세 여성, 1등석 승객 프로필 생성
+new_profile <- data.frame(
+  Pclass = factor("1", levels = levels(titanic$Pclass)),
+  Sex = factor("female", levels = levels(titanic$Sex)),
+  Age = 30,
+  SibSp = 0,
+  Parch = 0,
+  Fare = median(titanic$Fare[titanic$Pclass == "1"], na.rm = TRUE)
+)
+
+print("예측 프로필:")
+print(new_profile)
+
+# 생존 함수 예측
+surv_fit <- survfit(cox_model, newdata = new_profile)
+
+# 예측 결과를 데이터프레임으로 변환
+surv_data <- data.frame(
+  time = surv_fit$time,
+  survival = surv_fit$surv,
+  lower = surv_fit$lower,
+  upper = surv_fit$upper
+)
+
+# 생존 확률 곡선 시각화
+p3 <- ggplot(surv_data, aes(x = time, y = survival)) +
+  geom_line(color = "#0072B2", size = 1.5) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.3, fill = "#0072B2") +
+  labs(
+    title = "Predicted Survival Probability",
+    subtitle = "30-year-old Female, 1st Class Passenger",
+    x = "Time",
+    y = "Survival Probability"
+  ) +
+  ylim(0, 1) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+
+print(p3)
+
+# 특정 시점에서의 생존 확률
+initial_survival <- surv_fit$surv[1]
+print(paste("30세 여성 1등석 승객의 초기 생존 확률:", round(initial_survival, 3)))
+
+# 주요 결과 요약
+cat("\n=== 분석 결과 요약 ===\n")
+
+# 1. 그룹별 생존율
+survival_by_sex <- titanic %>%
+  group_by(Sex) %>%
+  summarise(
+    Count = n(),
+    Survivors = sum(status),
+    Survival_Rate = mean(status),
+    .groups = 'drop'
+  )
+
+survival_by_class <- titanic %>%
+  group_by(Pclass) %>%
+  summarise(
+    Count = n(),
+    Survivors = sum(status),
+    Survival_Rate = mean(status),
+    .groups = 'drop'
+  )
+
+print("성별 생존율:")
+print(survival_by_sex)
+
+print("객실 등급별 생존율:")
+print(survival_by_class)
+
+# 2. 주요 위험 요인 식별
+significant_vars <- hr_results[hr_results$p_value < 0.05, ]
+print("통계적으로 유의한 위험 요인:")
+print(significant_vars[, c("Variable", "HR", "p_value")])
+
+# 3. 실용적 시사점
+cat("\n=== 실용적 시사점 ===\n")
+cat("1. 성별 효과: 여성의 생존율이 남성보다 유의하게 높음\n")
+cat("2. 사회경제적 지위: 1등석 승객이 3등석 승객보다 높은 생존율\n")
+cat("3. 연령 효과: 연령 증가에 따른 생존율 변화 분석 필요\n")
+cat("4. 가족 구성: 동반 가족 수가 생존에 미치는 영향 고려\n")
+cat("5. 정책적 함의: '여성과 어린이 우선' 구조 정책의 실제 효과 확인\n")
