@@ -1,0 +1,75 @@
+/* 1. 데이터 로드 및 전처리 */
+proc import datafile='DJI_weekly.csv' out=dji dbms=csv replace;
+    getnames=yes;
+run;
+
+/* 날짜 변환 */
+data dji;
+    set dji;
+    date_var = input(Date, yymmdd10.);
+    format date_var date9.;
+run;
+
+/* 결측치 선형 보간 */
+proc expand data=dji out=dji_interp;
+    id date_var;
+    convert AdjClose = AdjClose_clean / method=join;
+run;
+
+/* 로그수익률 계산 */
+data dji_returns;
+    set dji_interp;
+    if _N_ > 1 then log_return = log(AdjClose_clean/lag(AdjClose_clean));
+    if _N_ > 1;
+run;
+
+/* IQR 기준 이상치 제거 */
+proc univariate data=dji_returns;
+    var log_return;
+    output out=quartiles pctlpts=25 75 pctlpre=Q_;
+run;
+
+data dji_clean;
+    if _N_=1 then set quartiles;
+    set dji_returns;
+    iqr = Q_75 - Q_25;
+    if log_return < Q_25 - 1.5*iqr or log_return > Q_75 + 1.5*iqr then delete;
+run;
+
+/* 2. STL 분해 (SAS는 X-12 사용, STL 대체) */
+proc timeseries data=dji_clean outdecomp=decomp;
+    id date_var interval=week;
+    var log_return;
+    decomp / mode=add seasonality=52;
+run;
+
+/* 분해 결과 시각화 */
+proc sgplot data=decomp;
+    series x=date_var y=trend / lineattrs=(color=blue);
+    title "Trend Component";
+run;
+
+proc sgplot data=decomp;
+    series x=date_var y=seasonal / lineattrs=(color=green);
+    title "Seasonal Component";
+run;
+
+/* 3. ARIMA 모델링 */
+proc arima data=dji_clean;
+    identify var=log_return nlag=40;
+    estimate p=(0:3) q=(0:3) method=ml;
+    forecast lead=8 alpha=0.05 out=forecast;
+run;
+
+/* 4. ARCH-LM 검정 및 GARCH 모델 */
+proc autoreg data=dji_clean;
+    model log_return = / archtest=(lags=(1:5));
+    model log_return = / garch=(q=1,p=1) dist=t;
+    output out=garch_out ht=volatility;
+run;
+
+/* GARCH 변동성 시각화 */
+proc sgplot data=garch_out;
+    series x=date_var y=volatility / lineattrs=(color=red);
+    title "GARCH(1,1) Conditional Volatility";
+run;
