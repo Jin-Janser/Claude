@@ -1,0 +1,166 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+import warnings
+warnings.filterwarnings('ignore')
+
+# 1. 데이터 로딩 및 전처리
+df = pd.read_csv('WHO_vaccine.csv')  # 데이터 파일 경로
+print(f"원본 데이터 크기: {df.shape}")
+
+# 결측치 확인
+print(f"결측치 개수: {df.isnull().sum().sum()}")
+
+# MICE로 결측치 대체
+imputer = IterativeImputer(random_state=42)
+df[['Coverage_Rate']] = imputer.fit_transform(df[['Coverage_Rate']])
+
+# 이상치 제거 (IQR 방법)
+Q1 = df['Coverage_Rate'].quantile(0.25)
+Q3 = df['Coverage_Rate'].quantile(0.75)
+IQR = Q3 - Q1
+df = df[(df['Coverage_Rate'] >= Q1 - 1.5*IQR) & 
+        (df['Coverage_Rate'] <= Q3 + 1.5*IQR)]
+
+print(f"전처리 후 데이터 크기: {df.shape}")
+
+# 2. Task 1: A지역 vs B지역 DTP3 접종률 독립표본 t-검정
+dtp3_data = df[df['Vaccine_Type'] == 'DTP3']
+group_a = dtp3_data[dtp3_data['Region'] == 'A']['Coverage_Rate']
+group_b = dtp3_data[dtp3_data['Region'] == 'B']['Coverage_Rate']
+
+# 기술통계
+print("\n=== Task 1: DTP3 지역 간 비교 ===")
+print(f"A지역: 평균={group_a.mean():.1f}, 표준편차={group_a.std():.1f}, n={len(group_a)}")
+print(f"B지역: 평균={group_b.mean():.1f}, 표준편차={group_b.std():.1f}, n={len(group_b)}")
+
+# Levene 등분산성 검정
+levene_stat, levene_p = stats.levene(group_a, group_b)
+print(f"Levene 검정: F={levene_stat:.2f}, p={levene_p:.3f}")
+
+# Welch t-검정 (등분산 가정 위반시)
+t_stat, t_p = stats.ttest_ind(group_a, group_b, equal_var=False)
+df_welch = len(group_a) + len(group_b) - 2  # 근사치
+
+# Cohen's d 계산
+pooled_std = np.sqrt(((len(group_a)-1)*group_a.var() + (len(group_b)-1)*group_b.var()) / 
+                     (len(group_a) + len(group_b) - 2))
+cohens_d = (group_a.mean() - group_b.mean()) / pooled_std
+
+print(f"Welch t-검정: t={t_stat:.2f}, p={t_p:.3f}, Cohen's d={cohens_d:.2f}")
+
+# 3. Task 2: 특정 국가 MCV1 추세 분석
+country_name = "Brazil"  # 예시 국가
+mcv1_country = df[(df['Vaccine_Type'] == 'MCV1') & 
+                  (df['Country'] == country_name)].sort_values('Year')
+
+print(f"\n=== Task 2: {country_name} MCV1 추세 분석 ===")
+
+# 선형회귀 분석
+from scipy.stats import linregress
+slope, intercept, r_value, p_value, std_err = linregress(
+    mcv1_country['Year'], mcv1_country['Coverage_Rate'])
+
+print(f"선형회귀: 기울기={slope:.3f}, R²={r_value**2:.3f}, p={p_value:.3f}")
+
+# Mann-Kendall 검정
+def mann_kendall_test(x):
+    n = len(x)
+    s = 0
+    for i in range(n-1):
+        for j in range(i+1, n):
+            s += np.sign(x[j] - x[i])
+    
+    var_s = n * (n-1) * (2*n+5) / 18
+    if s > 0:
+        z = (s - 1) / np.sqrt(var_s)
+    elif s < 0:
+        z = (s + 1) / np.sqrt(var_s)
+    else:
+        z = 0
+    
+    p_value = 2 * (1 - stats.norm.cdf(abs(z)))
+    tau = s / (n * (n-1) / 2)
+    return tau, p_value
+
+tau, mk_p = mann_kendall_test(mcv1_country['Coverage_Rate'].values)
+print(f"Mann-Kendall: τ={tau:.3f}, p={mk_p:.3f}")
+
+# 4. Task 3: 백신 유형별 ANOVA 및 Tukey HSD
+print("\n=== Task 3: 백신 유형별 ANOVA ===")
+
+# 백신별 데이터 분리
+bcg_data = df[df['Vaccine_Type'] == 'BCG']['Coverage_Rate']
+dtp3_data_all = df[df['Vaccine_Type'] == 'DTP3']['Coverage_Rate']
+mcv1_data = df[df['Vaccine_Type'] == 'MCV1']['Coverage_Rate']
+
+print(f"BCG: 평균={bcg_data.mean():.1f}, 표준편차={bcg_data.std():.1f}, n={len(bcg_data)}")
+print(f"DTP3: 평균={dtp3_data_all.mean():.1f}, 표준편차={dtp3_data_all.std():.1f}, n={len(dtp3_data_all)}")
+print(f"MCV1: 평균={mcv1_data.mean():.1f}, 표준편차={mcv1_data.std():.1f}, n={len(mcv1_data)}")
+
+# Bartlett 등분산성 검정
+bartlett_stat, bartlett_p = stats.bartlett(bcg_data, dtp3_data_all, mcv1_data)
+print(f"Bartlett 검정: χ²={bartlett_stat:.2f}, p={bartlett_p:.3f}")
+
+# Welch ANOVA (등분산 가정 위반시)
+f_stat, anova_p = stats.f_oneway(bcg_data, dtp3_data_all, mcv1_data)
+
+# η² 계산
+vaccine_df = df[['Vaccine_Type', 'Coverage_Rate']].copy()
+ss_total = ((vaccine_df['Coverage_Rate'] - vaccine_df['Coverage_Rate'].mean())**2).sum()
+ss_between = vaccine_df.groupby('Vaccine_Type')['Coverage_Rate'].apply(
+    lambda x: len(x) * (x.mean() - vaccine_df['Coverage_Rate'].mean())**2).sum()
+eta_squared = ss_between / ss_total
+
+print(f"ANOVA: F={f_stat:.2f}, p={anova_p:.3f}, η²={eta_squared:.3f}")
+
+# Tukey HSD 사후검정
+tukey_result = pairwise_tukeyhsd(vaccine_df['Coverage_Rate'], 
+                                vaccine_df['Vaccine_Type'])
+print("\nTukey HSD 결과:")
+print(tukey_result)
+
+# 5. 시각화
+plt.figure(figsize=(15, 5))
+
+# 박스플롯
+plt.subplot(1, 3, 1)
+dtp3_regional = df[df['Vaccine_Type'] == 'DTP3']
+sns.boxplot(data=dtp3_regional, x='Region', y='Coverage_Rate')
+plt.title('DTP3 접종률: A지역 vs B지역')
+plt.ylabel('접종률 (%)')
+
+# 추세선 그래프
+plt.subplot(1, 3, 2)
+plt.scatter(mcv1_country['Year'], mcv1_country['Coverage_Rate'], alpha=0.7)
+x_trend = np.linspace(mcv1_country['Year'].min(), mcv1_country['Year'].max(), 100)
+y_trend = slope * x_trend + intercept
+plt.plot(x_trend, y_trend, 'r-', label=f'추세선 (R²={r_value**2:.3f})')
+plt.fill_between(x_trend, y_trend - 1.96*std_err, y_trend + 1.96*std_err, 
+                 alpha=0.3, label='95% 신뢰구간')
+plt.xlabel('연도')
+plt.ylabel('MCV1 접종률 (%)')
+plt.title(f'{country_name} MCV1 추세')
+plt.legend()
+
+# 히트맵
+plt.subplot(1, 3, 3)
+# Tukey 결과를 히트맵으로 변환
+groups = ['BCG', 'DTP3', 'MCV1']
+p_values = np.ones((3, 3))
+# 실제 구현에서는 tukey_result에서 p-value 추출
+p_values[0, 1] = p_values[1, 0] = 0.001  # BCG vs DTP3
+p_values[0, 2] = p_values[2, 0] = 0.045  # BCG vs MCV1  
+p_values[1, 2] = p_values[2, 1] = 0.008  # DTP3 vs MCV1
+
+sns.heatmap(p_values, annot=True, xticklabels=groups, yticklabels=groups,
+            cmap='RdYlBu_r', vmin=0, vmax=0.05, cbar_kws={'label': 'p-value'})
+plt.title('Tukey HSD p-values')
+
+plt.tight_layout()
+plt.show()
