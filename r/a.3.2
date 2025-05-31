@@ -1,0 +1,497 @@
+# 필요한 패키지 설치 (주석 처리)
+# install.packages(c("brms", "sf", "spdep", "ggplot2", "dplyr", 
+#                   "loo", "bayesplot", "tmap", "CARBayes", "mapview"))
+
+# 라이브러리 로딩
+library(brms)        # 베이지안 모델링
+library(sf)          # 공간 데이터 처리
+library(spdep)       # 공간 통계
+library(ggplot2)     # 시각화
+library(dplyr)       # 데이터 조작
+library(loo)         # 모델 비교
+library(bayesplot)   # 베이지안 플롯
+library(tmap)        # 지도 시각화
+library(CARBayes)    # CAR 모델
+library(mapview)     # 인터랙티브 지도
+
+# 재현 가능한 결과를 위한 시드 설정
+set.seed(42)
+
+# === 가상 SEER 데이터 생성 ===
+# 실제 SEER 데이터 접근이 제한적이므로 현실적인 가상 데이터 생성
+
+# 지역 정보 (미국 주요 카운티 기반)
+n_regions <- 50
+regions <- data.frame(
+  region_id = 1:n_regions,
+  region_name = paste0("County_", sprintf("%02d", 1:n_regions)),
+  latitude = runif(n_regions, 32, 48),    # 미국 본토 위도
+  longitude = runif(n_regions, -125, -70), # 미국 본토 경도
+  population_density = rlnorm(n_regions, 6, 0.5)
+)
+
+# 연령 그룹, 성별, 인종 카테고리 정의
+age_groups <- c("0-19", "20-39", "40-59", "60-79", "80+")
+sex_categories <- c("Male", "Female")
+race_categories <- c("White", "Black", "Hispanic", "Asian", "Other")
+cancer_types <- c("Lung", "Breast", "Colorectal", "Prostate", "Other")
+years <- 2015:2020
+
+# 가상 SEER 데이터 생성
+generate_seer_data <- function() {
+  data_list <- list()
+  
+  for(region in 1:n_regions) {
+    for(year in years) {
+      for(age in age_groups) {
+        for(sex in sex_categories) {
+          for(race in race_categories) {
+            for(cancer in cancer_types) {
+              
+              # 성별-암종 조합 필터링
+              if((cancer == "Prostate" & sex == "Female") | 
+                 (cancer == "Breast" & sex == "Male")) next
+              
+              # 기본 발생률 (인구 10만명당)
+              base_rate <- case_when(
+                cancer == "Lung" ~ 45,
+                cancer == "Breast" ~ 125,
+                cancer == "Colorectal" ~ 35,
+                cancer == "Prostate" ~ 100,
+                TRUE ~ 20
+              )
+              
+              # 연령 효과
+              age_effect <- case_when(
+                age == "0-19" ~ 0.1,
+                age == "20-39" ~ 0.3,
+                age == "40-59" ~ 0.8,
+                age == "60-79" ~ 1.5,
+                age == "80+" ~ 2.2
+              )
+              
+              # 성별 효과
+              sex_effect <- ifelse(sex == "Male", 1.1, 1.0)
+              
+              # 인종 효과
+              race_effect <- case_when(
+                race == "White" ~ 1.0,
+                race == "Black" ~ 1.2,
+                race == "Hispanic" ~ 0.8,
+                race == "Asian" ~ 0.7,
+                race == "Other" ~ 0.9
+              )
+              
+              # 지역 효과 (지리적 클러스터링)
+              lat <- regions$latitude[region]
+              region_effect <- 1 + 0.3 * sin(lat * pi / 180) + 
+                              rnorm(1, 0, 0.1)
+              
+              # 시간 트렌드
+              year_effect <- 1 + 0.02 * (year - 2015)
+              
+              # 최종 발생률 계산
+              expected_rate <- base_rate * age_effect * sex_effect * 
+                             race_effect * region_effect * year_effect
+              
+              # 인구수 생성 (해당 그룹)
+              population <- rpois(1, 1000) + 100
+              
+              # 관측된 케이스 수 (포아송 분포)
+              expected_cases <- expected_rate * population / 100000
+              observed_cases <- rpois(1, max(expected_cases, 0.1))
+              
+              data_list[[length(data_list) + 1]] <- data.frame(
+                region_id = region,
+                region_name = regions$region_name[region],
+                latitude = regions$latitude[region],
+                longitude = regions$longitude[region],
+                year = year,
+                age_group = age,
+                sex = sex,
+                race = race,
+                cancer_type = cancer,
+                cases = observed_cases,
+                population = population,
+                crude_rate = (observed_cases / population) * 100000
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  return(do.call(rbind, data_list))
+}
+
+# 데이터 생성
+seer_data <- generate_seer_data()
+
+cat("=== SEER 데이터 기본 정보 ===\n")
+cat("총 관측치 수:", nrow(seer_data), "\n")
+cat("지역 수:", length(unique(seer_data$region_id)), "\n")
+cat("연도 범위:", min(seer_data$year), "-", max(seer_data$year), "\n")
+cat("결측치 수:", sum(is.na(seer_data)), "\n")
+
+# 데이터 요약 통계
+print(summary(seer_data$crude_rate))
+
+# === 데이터 전처리 ===
+
+# 결측치 및 이상치 처리
+# 극단적 이상치 제거 (발생률이 1000 이상인 경우)
+seer_data <- seer_data[seer_data$crude_rate < 1000, ]
+
+# 로그 변환을 위해 0인 경우 0.1로 대체
+seer_data$cases_adj <- ifelse(seer_data$cases == 0, 0.1, seer_data$cases)
+seer_data$log_rate <- log(seer_data$crude_rate + 0.1)
+
+# 범주형 변수를 factor로 변환
+seer_data$region_id <- as.factor(seer_data$region_id)
+seer_data$age_group <- factor(seer_data$age_group, 
+                             levels = c("0-19", "20-39", "40-59", "60-79", "80+"))
+seer_data$sex <- as.factor(seer_data$sex)
+seer_data$race <- as.factor(seer_data$race)
+seer_data$cancer_type <- as.factor(seer_data$cancer_type)
+
+# 연도를 중심화
+seer_data$year_centered <- seer_data$year - 2017
+
+cat("전처리 후 관측치 수:", nrow(seer_data), "\n")
+
+# === 공간 가중치 행렬 생성 ===
+
+# 지역별 중심점 좌표 추출
+region_coords <- seer_data %>%
+  group_by(region_id) %>%
+  summarise(
+    latitude = first(latitude),
+    longitude = first(longitude),
+    .groups = 'drop'
+  ) %>%
+  arrange(as.numeric(as.character(region_id)))
+
+# sf 객체 생성
+region_sf <- st_as_sf(region_coords, 
+                     coords = c("longitude", "latitude"), 
+                     crs = 4326)
+
+# 거리 기반 가중치 행렬 생성 (100km 임계값)
+coords_matrix <- st_coordinates(region_sf)
+distances <- as.matrix(dist(coords_matrix))
+
+# 100km 이내 이웃 관계 정의 (대략 1도 = 111km)
+threshold_km <- 100
+threshold_deg <- threshold_km / 111
+
+# 이웃 행렬 생성
+neighbors_matrix <- matrix(0, nrow = n_regions, ncol = n_regions)
+for(i in 1:n_regions) {
+  for(j in 1:n_regions) {
+    if(i != j && distances[i,j] <= threshold_deg) {
+      neighbors_matrix[i,j] <- 1
+    }
+  }
+}
+
+# 행 표준화된 가중치 행렬
+W <- neighbors_matrix
+row_sums <- rowSums(W)
+W_normalized <- W / ifelse(row_sums == 0, 1, row_sums)
+
+# 이웃 관계 요약
+cat("=== 공간 가중치 행렬 정보 ===\n")
+cat("평균 이웃 수:", mean(rowSums(neighbors_matrix)), "\n")
+cat("최대 이웃 수:", max(rowSums(neighbors_matrix)), "\n")
+cat("고립된 지역 수:", sum(rowSums(neighbors_matrix) == 0), "\n")
+
+# 공간 가중치를 리스트로 변환 (spdep 호환)
+neighbors_list <- mat2listw(neighbors_matrix, style = "W")
+
+# === 계층적 베이지안 모델 구축 ===
+
+# 모델 1: 기본 계층적 모델 (공간 효과 없음)
+cat("=== 기본 계층적 베이지안 모델 구축 ===\n")
+
+# 사전 분포 설정
+priors_basic <- c(
+  prior(normal(0, 1), class = Intercept),          # 약한 정보 사전분포
+  prior(normal(0, 0.5), class = b),                # 고정효과 사전분포
+  prior(exponential(1), class = sd, group = region_id), # 지역 random effect
+  prior(exponential(1), class = sigma)             # 잔차 분산
+)
+
+# 포아송 회귀 모델 (로그 링크)
+model_basic <- brm(
+  cases | trials(population) ~ 
+    age_group + sex + race + cancer_type + year_centered +
+    (1 | region_id),
+  data = seer_data,
+  family = binomial(link = "logit"),
+  prior = priors_basic,
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  cores = 4,
+  seed = 42,
+  control = list(adapt_delta = 0.95)
+)
+
+# 수렴 진단
+print(rhat(model_basic))
+print(neff_ratio(model_basic))
+
+# 모델 요약
+cat("\n=== 기본 계층적 모델 결과 ===\n")
+print(summary(model_basic))
+
+# 지역별 랜덤 효과 추출
+regional_effects_basic <- ranef(model_basic)$region_id
+
+cat("\n=== 지역별 랜덤 효과 (상위 10개) ===\n")
+regional_summary_basic <- regional_effects_basic[, , "Intercept"] %>%
+  as.data.frame() %>%
+  mutate(region_id = rownames(.)) %>%
+  arrange(desc(Estimate))
+
+print(head(regional_summary_basic, 10))
+
+# === CAR (Conditional Autoregressive) 모델 구축 ===
+
+cat("\n=== 공간적 CAR 모델 구축 ===\n")
+
+# CARBayes를 사용한 CAR 모델
+# 데이터 준비 (지역별 집계)
+car_data <- seer_data %>%
+  group_by(region_id, region_name, latitude, longitude) %>%
+  summarise(
+    total_cases = sum(cases),
+    total_population = sum(population),
+    crude_rate = (total_cases / total_population) * 100000,
+    .groups = 'drop'
+  ) %>%
+  arrange(as.numeric(as.character(region_id)))
+
+# CAR 모델 적합 (CARBayes 사용)
+car_model <- S.CARleroux(
+  formula = total_cases ~ 1,
+  family = "poisson",
+  data = car_data,
+  W = neighbors_matrix,
+  burnin = 5000,
+  n.sample = 10000,
+  thin = 10,
+  prior.mean.beta = 0,
+  prior.var.beta = 1000,
+  prior.tau2 = c(1, 0.01),
+  prior.nu2 = c(1, 0.01),
+  verbose = FALSE
+)
+
+cat("CAR 모델 수렴 진단:\n")
+print(car_model$modelfit)
+
+# 공간적 상관관계 매개변수 (rho)
+rho_posterior <- car_model$samples$rho
+cat("공간적 상관관계 매개변수 rho:\n")
+cat("평균:", mean(rho_posterior), "\n")
+cat("95% 크레디블 구간:", quantile(rho_posterior, c(0.025, 0.975)), "\n")
+
+# 공간적 랜덤 효과
+spatial_effects <- car_model$fitted.values
+car_data$spatial_effect <- spatial_effects
+
+# === 베이지안 모델 비교 ===
+
+cat("\n=== 모델 비교 (WAIC, LOO-CV) ===\n")
+
+# WAIC 계산
+waic_basic <- waic(model_basic)
+waic_spatial <- waic(model_spatial)
+
+# LOO-CV 계산
+loo_basic <- loo(model_basic)
+loo_spatial <- loo(model_spatial)
+
+# 모델 비교 결과표
+model_comparison <- data.frame(
+  Model = c("Basic Hierarchical", "Spatial Hierarchical"),
+  WAIC = c(waic_basic$estimates[3,1], waic_spatial$estimates[3,1]),
+  WAIC_SE = c(waic_basic$estimates[3,2], waic_spatial$estimates[3,2]),
+  LOO = c(loo_basic$estimates[3,1], loo_spatial$estimates[3,1]),
+  LOO_SE = c(loo_basic$estimates[3,2], loo_spatial$estimates[3,2])
+)
+
+print(model_comparison)
+
+# Pareto k 진단
+cat("\n=== Pareto k 진단 ===\n")
+cat("Basic model - Pareto k > 0.7:", sum(loo_basic$diagnostics$pareto_k > 0.7), "\n")
+cat("Spatial model - Pareto k > 0.7:", sum(loo_spatial$diagnostics$pareto_k > 0.7), "\n")
+
+# 모델 가중치 계산
+loo_compare_result <- loo_compare(loo_basic, loo_spatial)
+print(loo_compare_result)
+
+# === 사후 예측 검사 ===
+
+cat("\n=== 사후 예측 검사 ===\n")
+
+# 기본 모델 사후 예측
+pp_check(model_basic, ndraws = 50) +
+  ggtitle("Posterior Predictive Check - Basic Model")
+
+# 공간 모델 사후 예측
+pp_check(model_spatial, ndraws = 50) +
+  ggtitle("Posterior Predictive Check - Spatial Model")
+
+# === 결과 해석 및 시각화 ===
+
+# 지역별 암 발생률 예측 및 크레디블 구간
+cat("\n=== 지역별 위험도 추정 ===\n")
+
+# 기본 모델에서 지역별 효과 추출
+regional_effects <- ranef(model_basic)$region_id[, , "Intercept"]
+
+# 결과를 데이터프레임으로 변환
+risk_estimates <- data.frame(
+  region_id = as.numeric(rownames(regional_effects)),
+  mean_effect = regional_effects[, "Estimate"],
+  lower_ci = regional_effects[, "Q2.5"],
+  upper_ci = regional_effects[, "Q97.5"]
+) %>%
+  left_join(region_coords, by = "region_id") %>%
+  mutate(
+    risk_ratio = exp(mean_effect),
+    rr_lower = exp(lower_ci),
+    rr_upper = exp(upper_ci)
+  )
+
+# 고위험 지역 식별 (95% 크레디블 구간이 1 초과)
+high_risk_regions <- risk_estimates %>%
+  filter(rr_lower > 1) %>%
+  arrange(desc(risk_ratio))
+
+cat("고위험 지역 (95% 크레디블 구간 하한이 1 초과):\n")
+print(high_risk_regions)
+
+# 지도 시각화
+library(ggplot2)
+library(maps)
+
+# 미국 지도 데이터
+usa_map <- map_data("state")
+
+# 지역별 위험도 지도
+risk_map <- ggplot() +
+  geom_polygon(data = usa_map, 
+               aes(x = long, y = lat, group = group),
+               fill = "lightgray", color = "white") +
+  geom_point(data = risk_estimates,
+             aes(x = longitude, y = latitude, 
+                 color = risk_ratio, size = risk_ratio),
+             alpha = 0.7) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 1, name = "Risk Ratio") +
+  scale_size_continuous(range = c(1, 5), guide = "none") +
+  coord_fixed(1.3) +
+  theme_minimal() +
+  labs(title = "Regional Cancer Incidence Risk Ratios",
+       subtitle = "Bayesian Hierarchical Model Results",
+       x = "Longitude", y = "Latitude")
+
+print(risk_map)
+
+# === 인구통계학적 요인별 위험비 ===
+
+cat("\n=== 인구통계학적 요인별 위험비 ===\n")
+
+# 고정효과 추출
+fixed_effects <- fixef(model_basic)
+
+# 위험비 계산 (로짓 모델이므로 승산비)
+demographic_rr <- data.frame(
+  Factor = rownames(fixed_effects),
+  OR = exp(fixed_effects[, "Estimate"]),
+  OR_lower = exp(fixed_effects[, "Q2.5"]),
+  OR_upper = exp(fixed_effects[, "Q97.5"])
+) %>%
+  filter(Factor != "Intercept")
+
+print(demographic_rr)
+
+# 위험비 시각화
+ggplot(demographic_rr, aes(x = reorder(Factor, OR), y = OR)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = OR_lower, ymax = OR_upper), width = 0.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  coord_flip() +
+  scale_y_log10() +
+  labs(title = "Demographic Risk Factors - Odds Ratios",
+       subtitle = "95% Credible Intervals",
+       x = "Risk Factor", y = "Odds Ratio (log scale)") +
+  theme_minimal()
+
+# === 공간적 상관관계 분석 ===
+
+cat("\n=== 공간적 상관관계 패턴 ===\n")
+
+# Moran's I 통계량 계산 (관측된 발생률)
+moran_test <- moran.test(car_data$crude_rate, neighbors_list)
+cat("Moran's I 통계량:", moran_test$estimate[1], "\n")
+cat("p-value:", moran_test$p.value, "\n")
+
+# 공간적 자기상관 시각화
+moran_plot <- moran.plot(car_data$crude_rate, neighbors_list,
+                        main = "Moran's I Plot - Cancer Incidence Rates")
+
+# === 정책적 시사점 ===
+
+cat("\n=== 정책적 시사점 및 권고사항 ===\n")
+
+# 1. 고위험 지역 식별
+cat("1. 고위험 지역 (집중 관리 필요):\n")
+if(nrow(high_risk_regions) > 0) {
+  cat("   -", paste(high_risk_regions$region_name[1:min(5, nrow(high_risk_regions))], 
+                   collapse = ", "), "\n")
+} else {
+  cat("   - 통계적으로 유의한 고위험 지역 없음\n")
+}
+
+# 2. 인구통계학적 고위험 그룹
+high_risk_demo <- demographic_rr %>%
+  filter(OR_lower > 1) %>%
+  arrange(desc(OR))
+
+cat("\n2. 고위험 인구통계학적 그룹:\n")
+if(nrow(high_risk_demo) > 0) {
+  for(i in 1:nrow(high_risk_demo)) {
+    cat("   -", high_risk_demo$Factor[i], 
+        ": OR =", round(high_risk_demo$OR[i], 2), 
+        "(95% CI:", round(high_risk_demo$OR_lower[i], 2), "-", 
+        round(high_risk_demo$OR_upper[i], 2), ")\n")
+  }
+} else {
+  cat("   - 통계적으로 유의한 고위험 그룹 없음\n")
+}
+
+# 3. 공간적 클러스터링
+if(moran_test$p.value < 0.05) {
+  cat("\n3. 공간적 클러스터링이 유의하게 관찰됨 (Moran's I =", 
+      round(moran_test$estimate[1], 3), ")\n")
+  cat("   - 지역 간 협력적 암 예방 및 관리 프로그램 필요\n")
+  cat("   - 광역 단위 정책 수립 고려\n")
+} else {
+  cat("\n3. 지역별 발생률이 독립적으로 분포\n")
+  cat("   - 지역별 맞춤형 개별 정책 수립 적합\n")
+}
+
+# === 모델 성능 요약 ===
+
+cat("\n=== 최종 모델 성능 요약 ===\n")
+cat("최적 모델:", ifelse(model_comparison$WAIC[1] < model_comparison$WAIC[2], 
+                      "Basic Hierarchical", "Spatial Hierarchical"), "\n")
+cat("WAIC 차이:", abs(diff(model_comparison$WAIC)), "\n")
+cat("모델 복잡도 대비 성능 개선:", 
+    ifelse(abs(diff(model_comparison$WAIC)) > 2, "유의함", "미미함"), "\n")
