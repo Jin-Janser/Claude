@@ -1,0 +1,94 @@
+/* 1. 데이터 로딩 및 전처리 */
+proc import datafile="WHO_vaccine.csv" 
+    out=vaccine_raw 
+    dbms=csv 
+    replace;
+    getnames=yes;
+run;
+
+/* 결측치 확인 */
+proc freq data=vaccine_raw;
+    tables Coverage_Rate / missing;
+run;
+
+/* MICE 다중대체 */
+proc mi data=vaccine_raw out=vaccine_imputed nimpute=5;
+    var Coverage_Rate;
+run;
+
+/* 이상치 제거 */
+proc univariate data=vaccine_imputed noprint;
+    var Coverage_Rate;
+    output out=outlier_stats pctlpts=25 75 pctlpre=Q;
+run;
+
+data vaccine_clean;
+    if _n_ = 1 then set outlier_stats;
+    set vaccine_imputed;
+    iqr = Q75 - Q25;
+    if Coverage_Rate < Q25 - 1.5*iqr or Coverage_Rate > Q75 + 1.5*iqr then delete;
+run;
+
+/* 2. Task 1: DTP3 지역간 t-검정 */
+proc sort data=vaccine_clean; by Region; run;
+
+/* 기술통계 */
+proc means data=vaccine_clean n mean std;
+    where Vaccine_Type = "DTP3";
+    class Region;
+    var Coverage_Rate;
+run;
+
+/* Levene 검정 및 t-검정 */
+proc ttest data=vaccine_clean hovtest=levene;
+    where Vaccine_Type = "DTP3";
+    class Region;
+    var Coverage_Rate;
+run;
+
+/* 3. Task 2: 특정 국가 MCV1 추세 분석 */
+/* 선형회귀 분석 */
+proc reg data=vaccine_clean;
+    where Vaccine_Type = "MCV1" and Country = "Brazil";
+    model Coverage_Rate = Year;
+    output out=reg_output predicted=pred residual=resid;
+run;
+
+/* Mann-Kendall 검정 */
+proc npar1way data=vaccine_clean wilcoxon;
+    where Vaccine_Type = "MCV1" and Country = "Brazil";
+    class Year;
+    var Coverage_Rate;
+    exact kendall;
+run;
+
+/* 4. Task 3: 백신 유형별 ANOVA */
+/* 기술통계 */
+proc means data=vaccine_clean n mean std;
+    class Vaccine_Type;
+    var Coverage_Rate;
+run;
+
+/* Bartlett 검정 및 ANOVA */
+proc glm data=vaccine_clean;
+    class Vaccine_Type;
+    model Coverage_Rate = Vaccine_Type;
+    means Vaccine_Type / hovtest=bartlett tukey alpha=0.05;
+    lsmeans Vaccine_Type / adjust=tukey pdiff;
+run;
+
+/* 5. 시각화 */
+/* 박스플롯 */
+proc sgplot data=vaccine_clean;
+    where Vaccine_Type = "DTP3";
+    vbox Coverage_Rate / category=Region;
+    title "DTP3 접종률: A지역 vs B지역";
+run;
+
+/* 추세선 그래프 */
+proc sgplot data=vaccine_clean;
+    where Vaccine_Type = "MCV1" and Country = "Brazil";
+    scatter x=Year y=Coverage_Rate;
+    reg x=Year y=Coverage_Rate / clm;
+    title "Brazil MCV1 추세 (95% 신뢰구간 포함)";
+run;
