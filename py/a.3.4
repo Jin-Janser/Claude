@@ -1,0 +1,375 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.neighbors import KernelDensity
+from sklearn.model_selection import GridSearchCV, cross_val_score
+from scipy import stats
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+from statsmodels.regression.quantile_regression import QuantReg
+import warnings
+warnings.filterwarnings('ignore')
+
+# 한글 폰트 설정 (선택사항)
+plt.rcParams['font.family'] = 'DejaVu Sans'
+plt.rcParams['figure.figsize'] = (12, 8)
+
+# =============================================================================
+# 1. 데이터 생성 및 전처리
+# =============================================================================
+
+np.random.seed(42)
+n_samples = 5000
+
+# 기본 인구통계학적 변수 생성
+data = {
+    'gender': np.random.choice(['Male', 'Female'], n_samples, p=[0.52, 0.48]),
+    'education': np.random.choice(['High School', 'Bachelor', 'Master', 'PhD'], 
+                                 n_samples, p=[0.4, 0.35, 0.2, 0.05]),
+    'experience': np.random.exponential(8, n_samples),  # 경력 년수
+    'age': np.random.normal(40, 12, n_samples),
+    'region': np.random.choice(['Northeast', 'South', 'Midwest', 'West'], 
+                              n_samples, p=[0.18, 0.38, 0.21, 0.23])
+}
+
+# 연령 제한
+data['age'] = np.clip(data['age'], 22, 65)
+data['experience'] = np.clip(data['experience'], 0, data['age'] - 22)
+
+df = pd.DataFrame(data)
+
+# 소득 생성 (현실적인 분포를 위해 로그정규분포 사용)
+base_income = 45000  # 기본 소득
+
+# 교육 수준별 소득 배율
+education_multiplier = {
+    'High School': 1.0,
+    'Bachelor': 1.4,
+    'Master': 1.8,
+    'PhD': 2.3
+}
+
+# 성별 소득 격차 (현실적 반영)
+gender_multiplier = {'Male': 1.0, 'Female': 0.82}
+
+# 소득 계산
+df['income'] = base_income * (
+    df['education'].map(education_multiplier) *
+    df['gender'].map(gender_multiplier) *
+    (1 + df['experience'] * 0.02) *  # 경력 효과
+    np.random.lognormal(0, 0.4, n_samples)  # 개인차
+)
+
+# 소득 하한선 설정
+df['income'] = np.maximum(df['income'], 25000)
+
+print("데이터 기본 정보:")
+print(df.describe())
+print(f"\n결측치: {df.isnull().sum().sum()}")
+print(f"데이터 형태: {df.shape}")
+
+# 커널 밀도 시각화 함수
+def plot_kde_comparison(kde_results, title, log_scale=True):
+    """커널 밀도 추정 결과 시각화"""
+    plt.figure(figsize=(14, 6))
+    
+    # 원본 스케일 그래프
+    plt.subplot(1, 2, 1)
+    colors = plt.cm.Set1(np.linspace(0, 1, len(kde_results)))
+    
+    for i, (group, info) in enumerate(kde_results.items()):
+        data = info['data']
+        plt.hist(data, bins=50, alpha=0.3, density=True, 
+                color=colors[i], label=f'{group} (hist)')
+        
+        # KDE 곡선 그리기
+        if log_scale:
+            x_range = np.linspace(np.log(data.min()), np.log(data.max()), 200)
+            log_density = info['kde'].score_samples(x_range.reshape(-1, 1))
+            density = np.exp(log_density) / np.exp(x_range)  # 로그 스케일에서 원본으로 변환
+            x_range = np.exp(x_range)
+        else:
+            x_range = np.linspace(data.min(), data.max(), 200)
+            log_density = info['kde'].score_samples(np.log(x_range).reshape(-1, 1))
+            density = np.exp(log_density) / x_range
+            
+        plt.plot(x_range, density, color=colors[i], linewidth=2, 
+                label=f'{group} (KDE)')
+    
+    plt.xlabel('소득 ($)')
+    plt.ylabel('밀도')
+    plt.title(f'{title} - 소득 분포')
+    plt.legend()
+    plt.ticklabel_format(style='plain', axis='x')
+    
+    # 로그 스케일 그래프
+    plt.subplot(1, 2, 2)
+    for i, (group, info) in enumerate(kde_results.items()):
+        log_data = info['log_data']
+        plt.hist(log_data, bins=50, alpha=0.3, density=True, 
+                color=colors[i], label=f'{group} (hist)')
+        
+        x_range = np.linspace(log_data.min(), log_data.max(), 200)
+        log_density = info['kde'].score_samples(x_range.reshape(-1, 1))
+        plt.plot(x_range, np.exp(log_density), color=colors[i], 
+                linewidth=2, label=f'{group} (KDE)')
+    
+    plt.xlabel('로그 소득')
+    plt.ylabel('밀도')
+    plt.title(f'{title} - 로그 소득 분포')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.show()
+
+# 시각화 실행
+plot_kde_comparison(gender_kde, '성별')
+plot_kde_comparison(education_kde, '교육 수준')
+
+# =============================================================================
+# 3. 소득 불평등 지수 계산
+# =============================================================================
+
+def gini_coefficient(x):
+    """지니 계수 계산"""
+    # 데이터 정렬
+    x = np.sort(x)
+    n = len(x)
+    
+    # 지니 계수 공식: G = (2*sum(i*x_i))/(n*sum(x_i)) - (n+1)/n
+    cumsum = np.cumsum(x)
+    return (2 * np.sum((np.arange(1, n+1) * x))) / (n * np.sum(x)) - (n + 1) / n
+
+def atkinson_index(x, epsilon=0.5):
+    """앳킨슨 지수 계산"""
+    x = np.array(x)
+    x = x[x > 0]  # 양수만 사용
+    n = len(x)
+    
+    if epsilon == 1:
+        # 특수 케이스: epsilon = 1
+        geometric_mean = np.exp(np.mean(np.log(x)))
+        arithmetic_mean = np.mean(x)
+        return 1 - geometric_mean / arithmetic_mean
+    else:
+        # 일반적인 경우
+        mean_income = np.mean(x)
+        ede = (np.mean(x**(1-epsilon)))**(1/(1-epsilon))
+        return 1 - ede / mean_income
+
+def bootstrap_inequality_indices(data, n_bootstrap=1000, alpha=0.05):
+    """부트스트랩을 통한 불평등 지수 신뢰구간 추정"""
+    n = len(data)
+    gini_boots = []
+    atkinson_boots = []
+    
+    for _ in range(n_bootstrap):
+        # 복원 추출
+        boot_sample = np.random.choice(data, size=n, replace=True)
+        gini_boots.append(gini_coefficient(boot_sample))
+        atkinson_boots.append(atkinson_index(boot_sample))
+    
+    # 신뢰구간 계산
+    gini_ci = np.percentile(gini_boots, [100*alpha/2, 100*(1-alpha/2)])
+    atkinson_ci = np.percentile(atkinson_boots, [100*alpha/2, 100*(1-alpha/2)])
+    
+    return {
+        'gini': {'mean': np.mean(gini_boots), 'ci': gini_ci},
+        'atkinson': {'mean': np.mean(atkinson_boots), 'ci': atkinson_ci}
+    }
+
+# 전체 및 그룹별 불평등 지수 계산
+print("=== 소득 불평등 지수 분석 ===\n")
+
+# 전체 데이터
+overall_gini = gini_coefficient(df['income'])
+overall_atkinson = atkinson_index(df['income'])
+overall_bootstrap = bootstrap_inequality_indices(df['income'])
+
+print(f"전체 인구:")
+print(f"  지니 계수: {overall_gini:.4f}")
+print(f"  앳킨슨 지수: {overall_atkinson:.4f}")
+print(f"  지니 계수 95% 신뢰구간: [{overall_bootstrap['gini']['ci'][0]:.4f}, {overall_bootstrap['gini']['ci'][1]:.4f}]")
+print(f"  앳킨슨 지수 95% 신뢰구간: [{overall_bootstrap['atkinson']['ci'][0]:.4f}, {overall_bootstrap['atkinson']['ci'][1]:.4f}]\n")
+
+# 그룹별 분석
+inequality_results = []
+
+for group_col in ['gender', 'education']:
+    print(f"{group_col.capitalize()}별 불평등 지수:")
+    for group in df[group_col].unique():
+        group_data = df[df[group_col] == group]['income']
+        gini = gini_coefficient(group_data)
+        atkinson = atkinson_index(group_data)
+        bootstrap_result = bootstrap_inequality_indices(group_data)
+        
+        print(f"  {group}:")
+        print(f"    지니 계수: {gini:.4f} (95% CI: [{bootstrap_result['gini']['ci'][0]:.4f}, {bootstrap_result['gini']['ci'][1]:.4f}])")
+        print(f"    앳킨슨 지수: {atkinson:.4f} (95% CI: [{bootstrap_result['atkinson']['ci'][0]:.4f}, {bootstrap_result['atkinson']['ci'][1]:.4f}])")
+        
+        inequality_results.append({
+            'group_type': group_col,
+            'group': group,
+            'gini': gini,
+            'atkinson': atkinson,
+            'gini_ci_lower': bootstrap_result['gini']['ci'][0],
+            'gini_ci_upper': bootstrap_result['gini']['ci'][1],
+            'atkinson_ci_lower': bootstrap_result['atkinson']['ci'][0],
+            'atkinson_ci_upper': bootstrap_result['atkinson']['ci'][1]
+        })
+    print()
+
+# =============================================================================
+# 4. 분위 회귀 분석
+# =============================================================================
+
+# 교육 수준과 경력을 수치 변수로 변환
+education_years = {
+    'High School': 12,
+    'Bachelor': 16,
+    'Master': 18,
+    'PhD': 22
+}
+
+df['education_years'] = df['education'].map(education_years)
+df['male'] = (df['gender'] == 'Male').astype(int)
+
+# 분위 회귀 분석 수행
+quantiles = [0.1, 0.5, 0.9]  # 10분위, 50분위(중위수), 90분위
+ols_formula = 'income ~ education_years + experience + male'
+
+# OLS 회귀
+ols_model = smf.ols(ols_formula, data=df).fit()
+
+print("=== OLS 회귀 분석 결과 ===")
+print(ols_model.summary())
+
+# 분위 회귀 결과 저장
+quantile_results = {}
+
+print("\n=== 분위 회귀 분석 결과 ===\n")
+
+for q in quantiles:
+    # 분위 회귀 모델
+    quantile_model = smf.quantreg(ols_formula, data=df).fit(q=q)
+    quantile_results[q] = quantile_model
+    
+    print(f"{int(q*100)}분위 회귀 결과:")
+    print(f"교육 년수 계수: {quantile_model.params['education_years']:.2f} "
+          f"(p-값: {quantile_model.pvalues['education_years']:.4f})")
+    print(f"경력 계수: {quantile_model.params['experience']:.2f} "
+          f"(p-값: {quantile_model.pvalues['experience']:.4f})")
+    print(f"성별(남성) 계수: {quantile_model.params['male']:.2f} "
+          f"(p-값: {quantile_model.pvalues['male']:.4f})")
+    print(f"R-squared: {quantile_model.prsquared:.4f}\n")
+
+# 회귀 계수 비교 테이블 생성
+coef_comparison = pd.DataFrame({
+    'Variable': ['Intercept', 'Education Years', 'Experience', 'Male'],
+    'OLS': [ols_model.params['Intercept'], ols_model.params['education_years'], 
+            ols_model.params['experience'], ols_model.params['male']],
+    'Q10': [quantile_results[0.1].params['Intercept'], quantile_results[0.1].params['education_years'],
+            quantile_results[0.1].params['experience'], quantile_results[0.1].params['male']],
+    'Q50': [quantile_results[0.5].params['Intercept'], quantile_results[0.5].params['education_years'],
+            quantile_results[0.5].params['experience'], quantile_results[0.5].params['male']],
+    'Q90': [quantile_results[0.9].params['Intercept'], quantile_results[0.9].params['education_years'],
+            quantile_results[0.9].params['experience'], quantile_results[0.9].params['male']]
+})
+
+print("=== 회귀 계수 비교표 ===")
+print(coef_comparison.round(2))
+
+# =============================================================================
+# 5. 종합 시각화
+# =============================================================================
+
+# 종합 시각화
+fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+
+# 1. 소득 분포 비교 (성별)
+ax1 = axes[0, 0]
+for gender in ['Male', 'Female']:
+    data = df[df['gender'] == gender]['income']
+    ax1.hist(data, bins=50, alpha=0.6, label=gender, density=True)
+ax1.set_xlabel('소득 ($)')
+ax1.set_ylabel('밀도')
+ax1.set_title('성별 소득 분포')
+ax1.legend()
+
+# 2. 교육 수준별 소득 분포
+ax2 = axes[0, 1]
+df.boxplot(column='income', by='education', ax=ax2)
+ax2.set_xlabel('교육 수준')
+ax2.set_ylabel('소득 ($)')
+ax2.set_title('교육 수준별 소득 분포')
+
+# 3. 불평등 지수 비교
+ax3 = axes[0, 2]
+inequality_df = pd.DataFrame(inequality_results)
+gender_ineq = inequality_df[inequality_df['group_type'] == 'gender']
+x_pos = np.arange(len(gender_ineq))
+ax3.bar(x_pos - 0.2, gender_ineq['gini'], 0.4, label='지니 계수', alpha=0.7)
+ax3.bar(x_pos + 0.2, gender_ineq['atkinson'], 0.4, label='앳킨슨 지수', alpha=0.7)
+ax3.set_xlabel('성별')
+ax3.set_ylabel('불평등 지수')
+ax3.set_title('성별 소득 불평등 지수')
+ax3.set_xticks(x_pos)
+ax3.set_xticklabels(gender_ineq['group'])
+ax3.legend()
+
+# 4. 분위 회귀 계수 비교
+ax4 = axes[1, 0]
+variables = ['education_years', 'experience', 'male']
+var_names = ['교육 년수', '경력', '성별(남성)']
+x_pos = np.arange(len(variables))
+width = 0.2
+
+for i, q in enumerate(quantiles):
+    coefs = [quantile_results[q].params[var] for var in variables]
+    ax4.bar(x_pos + i*width, coefs, width, label=f'{int(q*100)}분위', alpha=0.7)
+
+ols_coefs = [ols_model.params[var] for var in variables]
+ax4.bar(x_pos + len(quantiles)*width, ols_coefs, width, label='OLS', alpha=0.7)
+
+ax4.set_xlabel('변수')
+ax4.set_ylabel('회귀 계수')
+ax4.set_title('분위별 회귀 계수 비교')
+ax4.set_xticks(x_pos + width * len(quantiles) / 2)
+ax4.set_xticklabels(var_names)
+ax4.legend()
+
+# 5. 소득 분위별 교육 효과
+ax5 = axes[1, 1]
+education_effects = [quantile_results[q].params['education_years'] for q in quantiles]
+ax5.plot([10, 50, 90], education_effects, 'o-', linewidth=2, markersize=8)
+ax5.axhline(y=ols_model.params['education_years'], color='red', 
+           linestyle='--', label='OLS 평균 효과')
+ax5.set_xlabel('소득 분위')
+ax5.set_ylabel('교육 년수 계수')
+ax5.set_title('분위별 교육의 소득 효과')
+ax5.legend()
+ax5.grid(True, alpha=0.3)
+
+# 6. 잔차 분석
+ax6 = axes[1, 2]
+fitted_values = ols_model.fittedvalues
+residuals = ols_model.resid
+ax6.scatter(fitted_values, residuals, alpha=0.5)
+ax6.axhline(y=0, color='red', linestyle='--')
+ax6.set_xlabel('예측값')
+ax6.set_ylabel('잔차')
+ax6.set_title('OLS 회귀 잔차 분석')
+
+plt.tight_layout()
+plt.show()
+
+# 통계적 유의성 요약
+print("\n=== 통계적 유의성 요약 (α = 0.05) ===")
+print("\n분위 회귀 분석 p-값:")
+for q in quantiles:
+    print(f"\n{int(q*100)}분위:")
+    for var in ['education_years', 'experience', 'male']:
+        p_val = quantile_results[q].pvalues[var]
+        significance = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else ""
+        print(f"  {var}: p = {p_val:.4f} {significance}")
