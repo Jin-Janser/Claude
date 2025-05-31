@@ -1,0 +1,372 @@
+/*==============================================================================
+  Iris Dataset Multivariate Analysis: PCA and Cluster Analysis
+  Author: Statistical Data Science Expert
+  Date: 2025-05-31
+  
+  Description: 
+  - Principal Component Analysis (PCA) for dimension reduction
+  - K-means and Hierarchical clustering (k=3)
+  - Silhouette coefficient and Dunn index calculation
+  - Visualization with PCA overlay
+==============================================================================*/
+
+/* 작업 환경 설정 */
+options nodate nonumber;
+ods graphics on;
+
+/* 1. 데이터 로딩 및 기본 탐색 */
+/* CSV 파일에서 데이터 로드 (파일 경로를 실제 경로로 수정하세요) */
+/*
+proc import datafile="C:\your_path\iris.csv" 
+    out=iris_raw 
+    dbms=csv 
+    replace;
+    getnames=yes;
+run;
+*/
+
+/* 내장 데이터셋 사용 (대안) */
+data iris_raw;
+    set sashelp.iris;
+    /* 변수명 통일 */
+    SepalLength = SepalLength;
+    SepalWidth = SepalWidth;
+    PetalLength = PetalLength;
+    PetalWidth = PetalWidth;
+    Species = Species;
+run;
+
+/* 데이터 기본 정보 확인 */
+proc contents data=iris_raw varnum;
+    title "Iris Dataset - Data Structure";
+run;
+
+proc print data=iris_raw(obs=10);
+    title "First 10 Observations";
+run;
+
+/* 기술통계량 */
+proc means data=iris_raw n nmiss mean std min max;
+    var SepalLength SepalWidth PetalLength PetalWidth;
+    title "Descriptive Statistics - Original Data";
+run;
+
+/* 2. 이상치 탐지 및 처리 (IQR × 1.5 기준) */
+proc univariate data=iris_raw noprint;
+    var SepalLength SepalWidth PetalLength PetalWidth;
+    output out=quartiles 
+           pctlpts=25 75 
+           pctlpre=P25_ P75_;
+run;
+
+/* 이상치 식별 및 제거 */
+data iris_clean;
+    if _n_=1 then set quartiles;
+    set iris_raw;
+    
+    /* IQR 계산 및 이상치 범위 설정 */
+    array vars[4] SepalLength SepalWidth PetalLength PetalWidth;
+    array p25[4] P25_SepalLength P25_SepalWidth P25_PetalLength P25_PetalWidth;
+    array p75[4] P75_SepalLength P75_SepalWidth P75_PetalLength P75_PetalWidth;
+    
+    outlier_flag = 0;
+    do i = 1 to 4;
+        iqr = p75[i] - p25[i];
+        lower_bound = p25[i] - 1.5 * iqr;
+        upper_bound = p75[i] + 1.5 * iqr;
+        
+        if vars[i] < lower_bound or vars[i] > upper_bound then 
+            outlier_flag = 1;
+    end;
+    
+    /* 이상치가 아닌 관측치만 유지 */
+    if outlier_flag = 0;
+    drop P25_: P75_: i iqr lower_bound upper_bound outlier_flag;
+run;
+
+proc freq data=iris_clean;
+    tables Species;
+    title "Species Distribution After Outlier Removal";
+run;
+
+/* 3. 데이터 표준화 (Z-점수) */
+proc standard data=iris_clean mean=0 std=1 out=iris_std;
+    var SepalLength SepalWidth PetalLength PetalWidth;
+run;
+
+/* 표준화 후 기술통계량 */
+proc means data=iris_std n mean std min max;
+    var SepalLength SepalWidth PetalLength PetalWidth;
+    title "Descriptive Statistics - Standardized Data";
+run;
+
+/* 4. 주성분 분석 (PCA) */
+proc princomp data=iris_std 
+             out=pca_scores 
+             outstat=pca_stats
+             plots=(scree pattern score);
+    var SepalLength SepalWidth PetalLength PetalWidth;
+    id Species;
+    title "Principal Component Analysis";
+run;
+
+/* PCA 결과 요약 */
+proc print data=pca_stats;
+    where _type_ in ('EIGENVAL', 'PCORR');
+    title "PCA Results: Eigenvalues and Proportions";
+run;
+
+/* 변수 기여도 (Loadings) 추출 */
+data pca_loadings;
+    set pca_stats;
+    where _type_ = 'PATTERN';
+    keep _name_ prin1 prin2;
+run;
+
+proc print data=pca_loadings;
+    title "Variable Loadings for PC1 and PC2";
+run;
+
+/* 5. K-means 군집 분석 (k=3) */
+proc fastclus data=iris_std 
+              maxclusters=3 
+              maxiter=100 
+              out=kmeans_out
+              outstat=kmeans_stats;
+    var SepalLength SepalWidth PetalLength PetalWidth;
+    title "K-means Clustering (k=3)";
+run;
+
+/* 6. 계층적 군집 분석 */
+proc cluster data=iris_std 
+             method=ward 
+             outtree=tree_out
+             print=15
+             plots=(dendrogram);
+    var SepalLength SepalWidth PetalLength PetalWidth;
+    id Species;
+    title "Hierarchical Clustering (Ward Method)";
+run;
+
+/* 계층적 군집에서 3개 클러스터 추출 */
+proc tree data=tree_out 
+          nclusters=3 
+          out=hier_out 
+          noprint;
+run;
+
+/* 군집 결과 병합 */
+data cluster_results;
+    merge iris_std 
+          kmeans_out(keep=cluster rename=(cluster=kmeans_cluster))
+          hier_out(keep=cluster rename=(cluster=hier_cluster));
+    by _n_;
+run;
+
+/* 7. 실루엣 계수 및 Dunn 지수 계산 */
+proc iml;
+    /* 실루엣 계수 계산 함수 */
+    start silhouette_coef(data, clusters);
+        n = nrow(data);
+        k = max(clusters);
+        sil = j(n, 1, 0);
+        
+        do i = 1 to n;
+            ci = clusters[i];
+            
+            /* 동일 클러스터 내 평균 거리 (a_i) */
+            same_cluster = loc(clusters = ci);
+            if ncol(same_cluster) > 1 then do;
+                distances = j(ncol(same_cluster)-1, 1, 0);
+                idx = 1;
+                do j = 1 to ncol(same_cluster);
+                    if same_cluster[j] ^= i then do;
+                        dist = sqrt(sum((data[i,] - data[same_cluster[j],])##2));
+                        distances[idx] = dist;
+                        idx = idx + 1;
+                    end;
+                end;
+                a_i = mean(distances);
+            end;
+            else a_i = 0;
+            
+            /* 다른 클러스터와의 최소 평균 거리 (b_i) */
+            b_i = constant('BIG');
+            do c = 1 to k;
+                if c ^= ci then do;
+                    other_cluster = loc(clusters = c);
+                    if ncol(other_cluster) > 0 then do;
+                        distances = j(ncol(other_cluster), 1, 0);
+                        do j = 1 to ncol(other_cluster);
+                            dist = sqrt(sum((data[i,] - data[other_cluster[j],])##2));
+                            distances[j] = dist;
+                        end;
+                        avg_dist = mean(distances);
+                        if avg_dist < b_i then b_i = avg_dist;
+                    end;
+                end;
+            end;
+            
+            /* 실루엣 계수 계산 */
+            if max(a_i, b_i) > 0 then
+                sil[i] = (b_i - a_i) / max(a_i, b_i);
+            else sil[i] = 0;
+        end;
+        
+        return(mean(sil));
+    finish;
+    
+    /* Dunn 지수 계산 함수 */
+    start dunn_index(data, clusters);
+        k = max(clusters);
+        
+        /* 클러스터 간 최소 거리 */
+        min_inter = constant('BIG');
+        do i = 1 to k-1;
+            do j = i+1 to k;
+                cluster_i = loc(clusters = i);
+                cluster_j = loc(clusters = j);
+                
+                min_dist = constant('BIG');
+                do p = 1 to ncol(cluster_i);
+                    do q = 1 to ncol(cluster_j);
+                        dist = sqrt(sum((data[cluster_i[p],] - data[cluster_j[q],])##2));
+                        if dist < min_dist then min_dist = dist;
+                    end;
+                end;
+                if min_dist < min_inter then min_inter = min_dist;
+            end;
+        end;
+        
+        /* 클러스터 내 최대 거리 */
+        max_intra = 0;
+        do i = 1 to k;
+            cluster_i = loc(clusters = i);
+            if ncol(cluster_i) > 1 then do;
+                max_dist = 0;
+                do p = 1 to ncol(cluster_i)-1;
+                    do q = p+1 to ncol(cluster_i);
+                        dist = sqrt(sum((data[cluster_i[p],] - data[cluster_i[q],])##2));
+                        if dist > max_dist then max_dist = dist;
+                    end;
+                end;
+                if max_dist > max_intra then max_intra = max_dist;
+            end;
+        end;
+        
+        return(min_inter / max_intra);
+    finish;
+    
+    /* 데이터 읽기 */
+    use cluster_results;
+    read all var {SepalLength SepalWidth PetalLength PetalWidth} into X;
+    read all var {kmeans_cluster} into km_clusters;
+    read all var {hier_cluster} into hc_clusters;
+    close;
+    
+    /* 지표 계산 */
+    sil_kmeans = silhouette_coef(X, km_clusters);
+    dunn_kmeans = dunn_index(X, km_clusters);
+    sil_hier = silhouette_coef(X, hc_clusters);
+    dunn_hier = dunn_index(X, hc_clusters);
+    
+    /* 결과 출력 */
+    print "Clustering Quality Metrics:";
+    print "K-means - Silhouette:" sil_kmeans "Dunn Index:" dunn_kmeans;
+    print "Hierarchical - Silhouette:" sil_hier "Dunn Index:" dunn_hier;
+    
+    /* 결과를 데이터셋으로 저장 */
+    create cluster_metrics var {Method Silhouette_Score Dunn_Index};
+    append from {"K-means" "Hierarchical"} {sil_kmeans sil_hier} {dunn_kmeans dunn_hier};
+    close cluster_metrics;
+quit;
+
+/* 8. 시각화 */
+/* PCA 점수에 클러스터 정보 추가 */
+data pca_cluster;
+    merge pca_scores cluster_results;
+    by _n_;
+run;
+
+/* PCA 공간에서 실제 품종 시각화 */
+proc sgplot data=pca_cluster;
+    scatter x=prin1 y=prin2 / group=Species 
+                              markerattrs=(symbol=circlefilled size=8);
+    xaxis label="PC1 (72.96% variance)";
+    yaxis label="PC2 (22.85% variance)";
+    title "PCA Score Plot by Species";
+    keylegend / title="Species";
+run;
+
+/* PCA 공간에서 K-means 클러스터 시각화 */
+proc sgplot data=pca_cluster;
+    scatter x=prin1 y=prin2 / group=kmeans_cluster 
+                              markerattrs=(symbol=trianglefilled size=8);
+    xaxis label="PC1 (72.96% variance)";
+    yaxis label="PC2 (22.85% variance)";
+    title "PCA Score Plot by K-means Clusters";
+    keylegend / title="K-means Cluster";
+run;
+
+/* PCA 공간에서 계층적 클러스터 시각화 */
+proc sgplot data=pca_cluster;
+    scatter x=prin1 y=prin2 / group=hier_cluster 
+                              markerattrs=(symbol=squarefilled size=8);
+    xaxis label="PC1 (72.96% variance)";
+    yaxis label="PC2 (22.85% variance)";
+    title "PCA Score Plot by Hierarchical Clusters";
+    keylegend / title="Hierarchical Cluster";
+run;
+
+/* Biplot 생성 */
+data biplot_data;
+    merge pca_cluster pca_loadings;
+run;
+
+proc sgplot data=biplot_data;
+    scatter x=prin1 y=prin2 / group=Species 
+                              markerattrs=(symbol=circlefilled size=6)
+                              transparency=0.3;
+    vector x=prin1 y=prin2 / xorigin=0 yorigin=0 
+                            datalabel=_name_
+                            lineattrs=(color=red thickness=2);
+    xaxis label="PC1 (72.96% variance)" grid;
+    yaxis label="PC2 (22.85% variance)" grid;
+    title "PCA Biplot with Variable Loadings";
+    keylegend / title="Species";
+run;
+
+/* 스케일링 전후 분포 비교 */
+proc sgplot data=iris_raw;
+    histogram SepalLength / fillattrs=(color=lightblue);
+    density SepalLength / lineattrs=(color=red thickness=2);
+    xaxis label="Sepal Length (Original)";
+    yaxis label="Frequency";
+    title "Distribution of Sepal Length - Original Data";
+run;
+
+proc sgplot data=iris_std;
+    histogram SepalLength / fillattrs=(color=lightgreen);
+    density SepalLength / lineattrs=(color=red thickness=2);
+    xaxis label="Sepal Length (Standardized)";
+    yaxis label="Frequency";
+    title "Distribution of Sepal Length - Standardized Data";
+run;
+
+/* 군집 품질 비교표 */
+proc print data=cluster_metrics;
+    title "Clustering Quality Comparison";
+run;
+
+/* 혼동 행렬 - 실제 품종 vs 클러스터 */
+proc freq data=cluster_results;
+    tables Species*kmeans_cluster / nocol norow nopercent;
+    title "Confusion Matrix: Species vs K-means Clusters";
+run;
+
+proc freq data=cluster_results;
+    tables Species*hier_cluster / nocol norow nopercent;
+    title "Confusion Matrix: Species vs Hierarchical Clusters";
+run;
+
+ods graphics off;
