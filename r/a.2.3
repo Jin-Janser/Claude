@@ -1,0 +1,208 @@
+# 필요한 라이브러리 로드
+library(brms)
+library(bayestestR)
+library(ggplot2)
+library(dplyr)
+library(loo)
+library(tidyverse)
+
+# 1. 데이터 로딩 및 전처리
+load_and_preprocess_data <- function() {
+  # 실제 데이터 로딩 (파일 경로 수정 필요)
+  # red_wine <- read.csv("winequality-red.csv", sep=";")
+  # white_wine <- read.csv("winequality-white.csv", sep=";")
+  # data <- rbind(red_wine, white_wine)
+  
+  # 샘플 데이터 생성
+  set.seed(42)
+  n <- 6497
+  
+  data <- data.frame(
+    fixed_acidity = rnorm(n, 8.32, 1.74),
+    volatile_acidity = rgamma(n, 2, rate=10),
+    citric_acid = rbeta(n, 2, 8),
+    residual_sugar = rexp(n, 1/2.5),
+    chlorides = rgamma(n, 3, rate=100),
+    free_sulfur_dioxide = rgamma(n, 2, rate=1/15),
+    total_sulfur_dioxide = rnorm(n, 46, 32),
+    density = rnorm(n, 0.9967, 0.0019),
+    pH = rnorm(n, 3.31, 0.15),
+    sulphates = rgamma(n, 4, rate=1/0.15),
+    alcohol = rnorm(n, 10.4, 1.07),
+    quality = sample(3:9, n, replace=TRUE, 
+                    prob=c(0.01, 0.05, 0.42, 0.40, 0.11, 0.01, 0.00))
+  )
+  
+  # 특성 변수 표준화
+  feature_cols <- names(data)[names(data) != "quality"]
+  data[feature_cols] <- scale(data[feature_cols])
+  
+  return(list(data=data, features=feature_cols))
+}
+
+# 2. 베이지안 회귀 모델 구축
+build_bayesian_models <- function(data, features) {
+  
+  # 약하게 정보적 사전분포 모델
+  weak_prior <- c(
+    prior(normal(0, 1), class = Intercept),
+    prior(normal(0, 1), class = b),
+    prior(exponential(1), class = sigma)
+  )
+  
+  model_weak <- brm(
+    quality ~ ., 
+    data = data,
+    prior = weak_prior,
+    iter = 4000, 
+    warmup = 2000,
+    chains = 4,
+    cores = 4,
+    seed = 42
+  )
+  
+  # 비정보적 사전분포 모델
+  flat_prior <- c(
+    prior(normal(0, 100), class = Intercept),
+    prior(normal(0, 100), class = b),
+    prior(exponential(0.01), class = sigma)
+  )
+  
+  model_flat <- brm(
+    quality ~ ., 
+    data = data,
+    prior = flat_prior,
+    iter = 4000, 
+    warmup = 2000,
+    chains = 4,
+    cores = 4,
+    seed = 42
+  )
+  
+  return(list(weak=model_weak, flat=model_flat))
+}
+
+# 3. 모델 비교
+compare_models <- function(data) {
+  
+  # 기본 모델
+  basic_model <- brm(
+    quality ~ .,
+    data = data,
+    iter = 2000, warmup = 1000,
+    chains = 4, cores = 4
+  )
+  
+  # 상호작용 모델
+  interaction_model <- brm(
+    quality ~ . + alcohol:volatile_acidity + alcohol:sulphates,
+    data = data,
+    iter = 2000, warmup = 1000,
+    chains = 4, cores = 4
+  )
+  
+  # 변수 선택 모델 (Horseshoe prior)
+  selection_model <- brm(
+    quality ~ .,
+    data = data,
+    prior = c(
+      prior(normal(0, 1), class = Intercept),
+      prior(horseshoe(), class = b)
+    ),
+    iter = 2000, warmup = 1000,
+    chains = 4, cores = 4
+  )
+  
+  # 모델 비교
+  models <- list(
+    basic = basic_model,
+    interaction = interaction_model,
+    selection = selection_model
+  )
+  
+  # WAIC 계산
+  waic_comparison <- loo_compare(
+    loo(basic_model),
+    loo(interaction_model), 
+    loo(selection_model)
+  )
+  
+  return(list(models=models, comparison=waic_comparison))
+}
+
+# 4. 결과 시각화
+create_visualizations <- function(model_weak, model_flat, features) {
+  
+  # 사후 분포 비교
+  plot_weak <- plot(model_weak, ask=FALSE)
+  plot_flat <- plot(model_flat, ask=FALSE)
+  
+  # 회귀계수 비교
+  posterior_weak <- as_draws_df(model_weak)
+  posterior_flat <- as_draws_df(model_flat)
+  
+  # 크레디블 구간 플롯
+  mcmc_areas(posterior_weak, pars=paste0("b_", features)) +
+    ggtitle("Posterior Distributions (Weakly Informative Prior)")
+  
+  # Trace plot
+  mcmc_trace(posterior_weak, pars=paste0("b_", features[1:5])) +
+    ggtitle("MCMC Trace Plots")
+}
+
+# 메인 실행
+main <- function() {
+  
+  # 데이터 로딩
+  result <- load_and_preprocess_data()
+  data <- result$data
+  features <- result$features
+  
+  cat("데이터 기본 정보:\n")
+  cat("샘플 수:", nrow(data), "\n")
+  cat("변수 수:", length(features), "\n")
+  print(table(data$quality))
+  
+  # 베이지안 모델 구축
+  models <- build_bayesian_models(data, features)
+  
+  # 모델 요약
+  cat("\n=== 약하게 정보적 사전분포 모델 요약 ===\n")
+  print(summary(models$weak))
+  
+  # 사전분포 민감도 분석
+  cat("\n=== 사전분포 민감도 분석 ===\n")
+  
+  posterior_weak <- describe_posterior(models$weak)
+  posterior_flat <- describe_posterior(models$flat)
+  
+  comparison_table <- data.frame(
+    Parameter = posterior_weak$Parameter,
+    Weak_Mean = posterior_weak$Mean,
+    Weak_CI_Low = posterior_weak$CI_low,
+    Weak_CI_High = posterior_weak$CI_high,
+    Flat_Mean = posterior_flat$Mean,
+    Flat_CI_Low = posterior_flat$CI_low,
+    Flat_CI_High = posterior_flat$CI_high
+  )
+  
+  comparison_table$Mean_Diff <- abs(comparison_table$Weak_Mean - comparison_table$Flat_Mean)
+  print(round(comparison_table, 3))
+  
+  # 모델 비교
+  cat("\n=== 모델 비교 ===\n")
+  model_comparison <- compare_models(data)
+  print(model_comparison$comparison)
+  
+  # 시각화
+  create_visualizations(models$weak, models$flat, features)
+  
+  return(list(
+    models = models,
+    comparison = comparison_table,
+    model_comparison = model_comparison
+  ))
+}
+
+# 실행
+results <- main()
