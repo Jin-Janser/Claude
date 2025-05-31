@@ -1,0 +1,77 @@
+# 필요한 패키지 로드
+library(zoo)
+library(forecast)
+library(rugarch)
+library(ggplot2)
+library(gridExtra)
+
+# 1. 데이터 로드 및 전처리
+# 파일 경로 수정 필요: 'DJI_weekly.csv'
+dji <- read.zoo('DJI_weekly.csv', header=TRUE, index.column=1, format='%Y-%m-%d')
+
+# 결측치 선형 보간
+dji$Adj.Close <- na.approx(dji$Adj.Close)
+
+# 로그수익률 계산
+log_returns <- diff(log(dji$Adj.Close))
+log_returns <- log_returns[!is.na(log_returns)]
+
+# IQR 기준 이상치 제거
+Q <- quantile(log_returns, c(0.25, 0.75))
+IQR_val <- Q[2] - Q[1]
+clean_returns <- log_returns[log_returns >= Q[1] - 1.5*IQR_val & 
+                            log_returns <= Q[2] + 1.5*IQR_val]
+
+cat("원본 데이터:", length(log_returns), "개\n")
+cat("정제 후 데이터:", length(clean_returns), "개\n")
+cat("제거된 이상치:", length(log_returns) - length(clean_returns), "개\n")
+
+# 2. STL 분해
+ts_returns <- ts(clean_returns, frequency=52)
+stl_decomp <- stl(ts_returns, s.window="periodic", robust=TRUE)
+
+# STL 분해 시각화
+plot(stl_decomp, main="STL Decomposition of Log Returns")
+
+# 3. ARIMA 모델링
+# ACF/PACF 플롯
+par(mfrow=c(2,1))
+Acf(clean_returns, main="ACF of Log Returns")
+Pacf(clean_returns, main="PACF of Log Returns")
+
+# 최적 ARIMA 모델 선택
+arima_fit <- auto.arima(ts_returns, seasonal=FALSE, ic="bic")
+summary(arima_fit)
+
+# 8주 예측
+arima_forecast <- forecast(arima_fit, h=8, level=95)
+plot(arima_forecast, main="ARIMA Forecast")
+print(arima_forecast)
+
+# ARIMA 잔차 진단
+checkresiduals(arima_fit)
+
+# 4. ARCH-LM 검정
+library(FinTS)
+arch_test <- ArchTest(residuals(arima_fit), lags=5)
+print(arch_test)
+
+# 5. GARCH(1,1) 모델
+garch_spec <- ugarchspec(
+  variance.model = list(model="sGARCH", garchOrder=c(1,1)),
+  mean.model = list(armaOrder=c(0,0)),
+  distribution.model = "std"
+)
+
+garch_fit <- ugarchfit(garch_spec, clean_returns)
+show(garch_fit)
+
+# 지속성 계수
+coefs <- coef(garch_fit)
+persistence <- coefs["alpha1"] + coefs["beta1"]
+cat("지속성 계수 (α+β):", persistence, "\n")
+
+# GARCH 변동성 시각화
+vol <- sigma(garch_fit)
+plot(vol, main="GARCH(1,1) Conditional Volatility", 
+     type="l", col="red", ylab="Volatility")
