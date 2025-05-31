@@ -1,0 +1,223 @@
+# 필요한 라이브러리 임포트
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from lifelines import KaplanMeierFitter, CoxPHFitter
+from lifelines.statistics import logrank_test
+from sklearn.preprocessing import LabelEncoder
+import warnings
+warnings.filterwarnings('ignore')
+
+# 한글 폰트 설정 (선택사항)
+plt.rcParams['font.family'] = 'DejaVu Sans'
+plt.rcParams['figure.figsize'] = (10, 6)
+
+# =============================================================================
+# 1. 데이터 로딩 및 전처리
+# =============================================================================
+
+# 데이터 로딩 (파일 경로 수정 필요)
+# df = pd.read_csv('train.csv')
+# 샘플 데이터로 대체 (실제 사용 시 위 코드 사용)
+import seaborn as sns
+df = sns.load_dataset('titanic')
+df = df.rename(columns={'survived': 'Survived', 'pclass': 'Pclass', 
+                       'sex': 'Sex', 'age': 'Age', 'sibsp': 'SibSp', 
+                       'parch': 'Parch', 'fare': 'Fare', 'embarked': 'Embarked'})
+
+print("데이터 기본 정보:")
+print(df.info())
+print("\n결측치 현황:")
+print(df.isnull().sum())
+
+# 결측치 처리
+df['Age'].fillna(df['Age'].median(), inplace=True)
+df['Embarked'].fillna(df['Embarked'].mode()[0], inplace=True)
+df['Fare'].fillna(df['Fare'].median(), inplace=True)
+
+# 범주형 변수 인코딩
+le_sex = LabelEncoder()
+le_embarked = LabelEncoder()
+
+df['Sex_encoded'] = le_sex.fit_transform(df['Sex'])  # male=0, female=1
+df['Embarked_encoded'] = le_embarked.fit_transform(df['Embarked'])
+
+# 연속형 변수 분포 확인 및 변환
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].hist(df['Age'], bins=30, alpha=0.7, edgecolor='black')
+axes[0].set_title('Age Distribution')
+axes[0].set_xlabel('Age')
+axes[0].set_ylabel('Frequency')
+
+axes[1].hist(df['Fare'], bins=30, alpha=0.7, edgecolor='black')
+axes[1].set_title('Fare Distribution (Original)')
+axes[1].set_xlabel('Fare')
+axes[1].set_ylabel('Frequency')
+plt.tight_layout()
+plt.show()
+
+# Fare 로그 변환 (0 값 처리)
+df['log_Fare'] = np.log1p(df['Fare'])  # log(1+x)
+
+# 생존분석을 위한 시간 변수 생성 (모든 관측치가 같은 시점에서 관찰되므로 1로 설정)
+df['duration'] = 1
+
+print("전처리 완료!")
+print(f"최종 데이터 크기: {df.shape}")
+
+# =============================================================================
+# 2. Kaplan-Meier 생존 곡선 및 로그-순위 검정
+# =============================================================================
+
+# 2.1 성별별 생존 곡선
+kmf = KaplanMeierFitter()
+
+plt.figure(figsize=(12, 5))
+
+# 성별별 분석
+plt.subplot(1, 2, 1)
+for sex, label in [(0, 'Male'), (1, 'Female')]:
+    mask = df['Sex_encoded'] == sex
+    kmf.fit(df.loc[mask, 'duration'], 
+            event_observed=df.loc[mask, 'Survived'], 
+            label=label)
+    kmf.plot_survival_function()
+
+plt.title('Kaplan-Meier Survival Curves by Sex')
+plt.xlabel('Time')
+plt.ylabel('Survival Probability')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+# 객실 등급별 분석
+plt.subplot(1, 2, 2)
+for pclass in [1, 2, 3]:
+    mask = df['Pclass'] == pclass
+    kmf.fit(df.loc[mask, 'duration'], 
+            event_observed=df.loc[mask, 'Survived'], 
+            label=f'Class {pclass}')
+    kmf.plot_survival_function()
+
+plt.title('Kaplan-Meier Survival Curves by Passenger Class')
+plt.xlabel('Time')
+plt.ylabel('Survival Probability')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# 로그-순위 검정
+print("\n=== 로그-순위 검정 결과 ===")
+
+# 성별 간 차이 검정
+male_data = df[df['Sex_encoded'] == 0]
+female_data = df[df['Sex_encoded'] == 1]
+
+logrank_sex = logrank_test(male_data['duration'], female_data['duration'],
+                          event_observed_A=male_data['Survived'],
+                          event_observed_B=female_data['Survived'])
+
+print(f"성별 간 생존율 차이:")
+print(f"검정통계량: {logrank_sex.test_statistic:.4f}")
+print(f"p-값: {logrank_sex.p_value:.4e}")
+
+# 객실 등급 간 차이 검정 (1등석 vs 3등석)
+class1_data = df[df['Pclass'] == 1]
+class3_data = df[df['Pclass'] == 3]
+
+logrank_class = logrank_test(class1_data['duration'], class3_data['duration'],
+                            event_observed_A=class1_data['Survived'],
+                            event_observed_B=class3_data['Survived'])
+
+print(f"\n1등석 vs 3등석 생존율 차이:")
+print(f"검정통계량: {logrank_class.test_statistic:.4f}")
+print(f"p-값: {logrank_class.p_value:.4e}")
+
+# =============================================================================
+# 3. Cox Proportional Hazards 모델
+# =============================================================================
+
+# Cox 모델을 위한 데이터 준비
+cox_data = df[['duration', 'Survived', 'Pclass', 'Sex_encoded', 'Age', 
+               'SibSp', 'Parch', 'log_Fare']].copy()
+cox_data.columns = ['duration', 'event', 'Pclass', 'Sex', 'Age', 
+                   'SibSp', 'Parch', 'log_Fare']
+
+# Cox 모델 적합
+cph = CoxPHFitter()
+cph.fit(cox_data, duration_col='duration', event_col='event', show_progress=False)
+
+print("\n=== Cox Proportional Hazards 모델 결과 ===")
+print(cph.summary[['coef', 'exp(coef)', 'se(coef)', 'p', 
+                   'exp(coef) lower 95%', 'exp(coef) upper 95%']].round(4))
+
+# 모델 계수 시각화
+plt.figure(figsize=(10, 6))
+cph.plot()
+plt.title('Cox Model Coefficients with 95% Confidence Intervals')
+plt.xlabel('log(Hazard Ratio)')
+plt.grid(True, alpha=0.3)
+plt.show()
+
+# 비례위험 가정 검증
+print("\n=== 비례위험 가정 검증 ===")
+try:
+    cph.check_assumptions(cox_data, p_value_threshold=0.05, show_plots=False)
+    print("비례위험 가정이 대체로 만족됩니다.")
+except:
+    print("주의: 일부 변수에서 비례위험 가정 위반 가능성이 있습니다.")
+
+# =============================================================================
+# 4. 특정 프로필 생존 확률 예측
+# =============================================================================
+
+# 30세 여성, 1등석 승객 프로필 생성
+profile = pd.DataFrame({
+    'Pclass': [1],
+    'Sex': [1],  # female
+    'Age': [30],
+    'SibSp': [0],
+    'Parch': [0],
+    'log_Fare': [np.log1p(50)]  # 적당한 1등석 요금
+})
+
+# 생존 함수 예측
+survival_func = cph.predict_survival_function(profile)
+
+# 시각화
+plt.figure(figsize=(10, 6))
+plt.plot(survival_func.index, survival_func.iloc[:, 0], 
+         linewidth=2, color='blue', label='30yo Female, 1st Class')
+plt.fill_between(survival_func.index, survival_func.iloc[:, 0], 
+                 alpha=0.3, color='blue')
+plt.title('Predicted Survival Probability: 30-year-old Female, 1st Class Passenger')
+plt.xlabel('Time')
+plt.ylabel('Survival Probability')
+plt.ylim(0, 1)
+plt.grid(True, alpha=0.3)
+plt.legend()
+plt.show()
+
+print(f"\n30세 여성 1등석 승객의 예측 생존 확률: {survival_func.iloc[0, 0]:.3f}")
+
+# =============================================================================
+# 5. 추가 분석: 생존율 요약 통계
+# =============================================================================
+
+print("\n=== 그룹별 생존율 요약 ===")
+survival_by_sex = df.groupby('Sex')['Survived'].agg(['count', 'sum', 'mean'])
+survival_by_sex.columns = ['Total', 'Survivors', 'Survival_Rate']
+print("성별별 생존율:")
+print(survival_by_sex.round(3))
+
+survival_by_class = df.groupby('Pclass')['Survived'].agg(['count', 'sum', 'mean'])
+survival_by_class.columns = ['Total', 'Survivors', 'Survival_Rate']
+print("\n객실 등급별 생존율:")
+print(survival_by_class.round(3))
+
+# 교차표 생성
+crosstab = pd.crosstab(df['Sex'], df['Pclass'], 
+                      values=df['Survived'], aggfunc='mean')
+print("\n성별 × 객실등급별 생존율:")
+print(crosstab.round(3))
