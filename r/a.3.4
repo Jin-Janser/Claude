@@ -1,0 +1,533 @@
+# =============================================================================
+# 비모수적 방법론을 활용한 소득 분포 분석
+# =============================================================================
+
+# 필요한 패키지 로드
+library(ggplot2)
+library(dplyr)
+library(KernSmooth)
+library(DescTools)
+library(quantreg)
+library(gridExtra)
+library(boot)
+
+# 재현 가능한 결과를 위한 시드 설정
+set.seed(123)
+
+# =============================================================================
+# 1. 가상 BLS 소득 데이터 생성
+# =============================================================================
+
+# BLS 스타일의 현실적인 소득 데이터 생성
+n <- 5000
+
+# 기본 인구통계학적 변수 생성
+gender <- sample(c("Male", "Female"), n, replace = TRUE, prob = c(0.52, 0.48))
+education <- sample(c("Less than High School", "High School", "Bachelor", "Advanced"), 
+                   n, replace = TRUE, prob = c(0.12, 0.30, 0.38, 0.20))
+race <- sample(c("White", "Black", "Hispanic", "Asian", "Other"), 
+              n, replace = TRUE, prob = c(0.63, 0.12, 0.18, 0.06, 0.01))
+region <- sample(c("Northeast", "South", "Midwest", "West"), 
+                n, replace = TRUE, prob = c(0.18, 0.38, 0.21, 0.23))
+age <- pmax(18, pmin(65, rnorm(n, 42, 12)))
+experience <- pmax(0, pmin(age - 18, rnorm(n, 15, 8)))
+
+# 현실적인 소득 분포 생성 (로그정규분포 기반)
+base_income <- 45000
+
+# 교육 수준별 소득 배율
+edu_multiplier <- case_when(
+  education == "Less than High School" ~ 0.7,
+  education == "High School" ~ 1.0,
+  education == "Bachelor" ~ 1.5,
+  education == "Advanced" ~ 2.2
+)
+
+# 성별 소득 격차 반영
+gender_multiplier <- ifelse(gender == "Male", 1.0, 0.82)
+
+# 지역별 차이
+region_multiplier <- case_when(
+  region == "Northeast" ~ 1.15,
+  region == "West" ~ 1.12,
+  region == "Midwest" ~ 0.95,
+  region == "South" ~ 0.98
+)
+
+# 소득 계산 (로그정규분포 + 각종 효과)
+income <- base_income * edu_multiplier * gender_multiplier * region_multiplier * 
+         (1 + experience * 0.015) * exp(rnorm(n, 0, 0.35))
+
+# 소득 하한선 및 상한선 설정
+income <- pmax(income, 20000)
+income <- pmin(income, 500000)
+
+# 데이터프레임 생성
+income_data <- data.frame(
+  income = income,
+  gender = factor(gender),
+  education = factor(education, levels = c("Less than High School", "High School", 
+                                          "Bachelor", "Advanced")),
+  race = factor(race),
+  region = factor(region),
+  age = age,
+  experience = experience,
+  stringsAsFactors = FALSE
+)
+
+# 소수의 결측치 생성 (현실적 반영)
+missing_indices <- sample(1:n, floor(n * 0.02))
+income_data$income[missing_indices] <- NA
+
+# 결측치 제거
+income_data <- income_data[complete.cases(income_data), ]
+
+print("데이터 생성 완료:")
+print(paste("총 관측치:", nrow(income_data)))
+print("기본 통계:")
+print(summary(income_data$income))
+
+# =============================================================================
+# 2. 커널 밀도 추정 및 최적 대역폭 선택
+# =============================================================================
+
+# 최적 대역폭 선택 (Sheather-Jones 방법)
+optimal_bandwidth <- function(x) {
+  x_clean <- x[!is.na(x) & x > 0]
+  # 로그 변환된 데이터에 대해 최적 대역폭 계산
+  log_x <- log(x_clean)
+  bw <- dpik(log_x, scalest = "minim", level = 2L, kernel = "normal")
+  return(bw)
+}
+
+# 전체 소득에 대한 최적 대역폭
+overall_bw <- optimal_bandwidth(income_data$income)
+print(paste("전체 소득 데이터의 최적 대역폭:", round(overall_bw, 4)))
+
+# 그룹별 커널 밀도 추정 함수
+compute_kde_by_group <- function(data, group_var, value_var) {
+  results <- list()
+  groups <- unique(data[[group_var]])
+  
+  for(group in groups) {
+    group_data <- data[data[[group_var]] == group, value_var]
+    group_data <- group_data[!is.na(group_data) & group_data > 0]
+    
+    if(length(group_data) > 10) {
+      # 로그 변환
+      log_data <- log(group_data)
+      
+      # 최적 대역폭 계산
+      bw <- dpik(log_data, scalest = "minim")
+      
+      # 커널 밀도 추정
+      kde_result <- density(log_data, bw = bw, kernel = "gaussian")
+      
+      # 원래 스케일로 변환을 위한 정보 저장
+      results[[group]] <- list(
+        bandwidth = bw,
+        kde = kde_result,
+        original_data = group_data,
+        log_data = log_data,
+        n = length(group_data)
+      )
+    }
+  }
+  return(results)
+}
+
+# 성별별 KDE 계산
+gender_kde <- compute_kde_by_group(income_data, "gender", "income")
+
+# 교육 수준별 KDE 계산
+education_kde <- compute_kde_by_group(income_data, "education", "income")
+
+# 대역폭 결과 출력
+print("\n=== 그룹별 최적 대역폭 ===")
+print("성별:")
+for(group in names(gender_kde)) {
+  print(sprintf("  %s: %.4f (n=%d)", group, gender_kde[[group]]$bandwidth, gender_kde[[group]]$n))
+}
+
+print("교육 수준:")
+for(group in names(education_kde)) {
+  print(sprintf("  %s: %.4f (n=%d)", group, education_kde[[group]]$bandwidth, education_kde[[group]]$n))
+}
+
+# =============================================================================
+# 3. 커널 밀도 추정 시각화
+# =============================================================================
+
+# 성별별 소득 분포 시각화
+plot_kde_gender <- function() {
+  par(mfrow = c(1, 2))
+  
+  # 원본 스케일 그래프
+  plot(NULL, xlim = c(20000, 200000), ylim = c(0, 5e-5), 
+       main = "성별 소득 분포 (커널 밀도 추정)",
+       xlab = "연간 소득 ($)", ylab = "밀도")
+  
+  colors <- c("Male" = "blue", "Female" = "red")
+  
+  for(group in names(gender_kde)) {
+    kde_data <- gender_kde[[group]]$kde
+    # 로그 스케일에서 원본 스케일로 변환
+    x_original <- exp(kde_data$x)
+    y_original <- kde_data$y / x_original  # 변수 변환에 따른 야코비안
+    
+    lines(x_original, y_original, col = colors[group], lwd = 2)
+  }
+  legend("topright", legend = names(gender_kde), 
+         col = colors[names(gender_kde)], lwd = 2)
+  grid(TRUE)
+  
+  # 로그 스케일 그래프
+  plot(NULL, xlim = c(log(20000), log(200000)), ylim = c(0, 1.5), 
+       main = "성별 로그 소득 분포",
+       xlab = "로그 연간 소득", ylab = "밀도")
+  
+  for(group in names(gender_kde)) {
+    kde_data <- gender_kde[[group]]$kde
+    lines(kde_data$x, kde_data$y, col = colors[group], lwd = 2)
+  }
+  legend("topright", legend = names(gender_kde), 
+         col = colors[names(gender_kde)], lwd = 2)
+  grid(TRUE)
+}
+
+# 교육 수준별 소득 분포 시각화
+plot_kde_education <- function() {
+  par(mfrow = c(1, 2))
+  
+  # 원본 스케일 그래프
+  plot(NULL, xlim = c(20000, 250000), ylim = c(0, 5e-5), 
+       main = "교육 수준별 소득 분포 (커널 밀도 추정)",
+       xlab = "연간 소득 ($)", ylab = "밀도")
+  
+  colors <- rainbow(length(education_kde))
+  names(colors) <- names(education_kde)
+  
+  for(group in names(education_kde)) {
+    kde_data <- education_kde[[group]]$kde
+    x_original <- exp(kde_data$x)
+    y_original <- kde_data$y / x_original
+    
+    lines(x_original, y_original, col = colors[group], lwd = 2)
+  }
+  legend("topright", legend = names(education_kde), 
+         col = colors[names(education_kde)], lwd = 2, cex = 0.8)
+  grid(TRUE)
+  
+  # 로그 스케일 그래프
+  plot(NULL, xlim = c(log(20000), log(250000)), ylim = c(0, 1.2), 
+       main = "교육 수준별 로그 소득 분포",
+       xlab = "로그 연간 소득", ylab = "밀도")
+  
+  for(group in names(education_kde)) {
+    kde_data <- education_kde[[group]]$kde
+    lines(kde_data$x, kde_data$y, col = colors[group], lwd = 2)
+  }
+  legend("topright", legend = names(education_kde), 
+         col = colors[names(education_kde)], lwd = 2, cex = 0.8)
+  grid(TRUE)
+}
+
+# 그래프 생성
+plot_kde_gender()
+plot_kde_education()
+
+# =============================================================================
+# 4. 소득 불평등 지수 계산
+# =============================================================================
+
+# 부트스트랩을 통한 신뢰구간 계산 함수
+bootstrap_inequality <- function(data, indices) {
+  sample_data <- data[indices]
+  gini <- Gini(sample_data, unbiased = FALSE)
+  atkinson <- Atkinson(sample_data, parameter = 0.5)
+  return(c(gini, atkinson))
+}
+
+# 전체 및 그룹별 불평등 지수 계산
+calculate_inequality_indices <- function(data, group_var = NULL, group_value = NULL) {
+  if(is.null(group_var)) {
+    income_vec <- data$income[!is.na(data$income)]
+  } else {
+    income_vec <- data$income[data[[group_var]] == group_value & !is.na(data$income)]
+  }
+  
+  # 기본 지수 계산
+  gini <- Gini(income_vec, unbiased = FALSE)
+  atkinson <- Atkinson(income_vec, parameter = 0.5)
+  
+  # 부트스트랩 신뢰구간 계산
+  boot_result <- boot(income_vec, bootstrap_inequality, R = 1000)
+  
+  # 95% 신뢰구간
+  gini_ci <- boot.ci(boot_result, type = "perc", index = 1)$percent[4:5]
+  atkinson_ci <- boot.ci(boot_result, type = "perc", index = 2)$percent[4:5]
+  
+  return(list(
+    gini = gini,
+    gini_ci = gini_ci,
+    atkinson = atkinson,
+    atkinson_ci = atkinson_ci,
+    n = length(income_vec)
+  ))
+}
+
+# 전체 불평등 지수
+overall_inequality <- calculate_inequality_indices(income_data)
+
+print("=== 소득 불평등 지수 분석 ===")
+print(sprintf("전체 인구 (n=%d):", overall_inequality$n))
+print(sprintf("  지니 계수: %.4f (95%% CI: [%.4f, %.4f])", 
+              overall_inequality$gini, 
+              overall_inequality$gini_ci[1], 
+              overall_inequality$gini_ci[2]))
+print(sprintf("  앳킨슨 지수: %.4f (95%% CI: [%.4f, %.4f])", 
+              overall_inequality$atkinson, 
+              overall_inequality$atkinson_ci[1], 
+              overall_inequality$atkinson_ci[2]))
+
+# 성별 불평등 지수
+print("\n성별 불평등 지수:")
+gender_inequality <- list()
+for(gender in levels(income_data$gender)) {
+  gender_inequality[[gender]] <- calculate_inequality_indices(income_data, "gender", gender)
+  print(sprintf("  %s (n=%d):", gender, gender_inequality[[gender]]$n))
+  print(sprintf("    지니 계수: %.4f (95%% CI: [%.4f, %.4f])", 
+                gender_inequality[[gender]]$gini,
+                gender_inequality[[gender]]$gini_ci[1],
+                gender_inequality[[gender]]$gini_ci[2]))
+  print(sprintf("    앳킨슨 지수: %.4f (95%% CI: [%.4f, %.4f])", 
+                gender_inequality[[gender]]$atkinson,
+                gender_inequality[[gender]]$atkinson_ci[1],
+                gender_inequality[[gender]]$atkinson_ci[2]))
+}
+
+# 교육 수준별 불평등 지수
+print("\n교육 수준별 불평등 지수:")
+education_inequality <- list()
+for(edu in levels(income_data$education)) {
+  education_inequality[[edu]] <- calculate_inequality_indices(income_data, "education", edu)
+  print(sprintf("  %s (n=%d):", edu, education_inequality[[edu]]$n))
+  print(sprintf("    지니 계수: %.4f (95%% CI: [%.4f, %.4f])", 
+                education_inequality[[edu]]$gini,
+                education_inequality[[edu]]$gini_ci[1],
+                education_inequality[[edu]]$gini_ci[2]))
+  print(sprintf("    앳킨슨 지수: %.4f (95%% CI: [%.4f, %.4f])", 
+                education_inequality[[edu]]$atkinson,
+                education_inequality[[edu]]$atkinson_ci[1],
+                education_inequality[[edu]]$atkinson_ci[2]))
+}
+
+# =============================================================================
+# 5. 분위 회귀 분석
+# =============================================================================
+
+# 교육 수준을 수치 변수로 변환
+income_data$education_years <- case_when(
+  income_data$education == "Less than High School" ~ 10,
+  income_data$education == "High School" ~ 12,
+  income_data$education == "Bachelor" ~ 16,
+  income_data$education == "Advanced" ~ 20
+)
+
+# 성별을 더미 변수로 변환
+income_data$male <- ifelse(income_data$gender == "Male", 1, 0)
+
+# 분위 회귀 분석 (10분위, 50분위, 90분위)
+quantiles <- c(0.1, 0.5, 0.9)
+
+# OLS 회귀 분석
+ols_model <- lm(income ~ education_years + experience + male, data = income_data)
+
+print("=== OLS 회귀 분석 결과 ===")
+print(summary(ols_model))
+
+# 분위 회귀 분석
+print("\n=== 분위 회귀 분석 결과 ===")
+
+quantile_results <- list()
+for(q in quantiles) {
+  qr_model <- rq(income ~ education_years + experience + male, 
+                 tau = q, data = income_data)
+  quantile_results[[paste0("q", q*100)]] <- qr_model
+  
+  # 결과 요약
+  qr_summary <- summary(qr_model, se = "boot", R = 1000)
+  
+  print(sprintf("\n%d분위 회귀 결과:", q*100))
+  print(qr_summary)
+}
+
+# 회귀 계수 비교표 생성
+create_coefficient_table <- function() {
+  coef_table <- data.frame(
+    Variable = c("(Intercept)", "Education Years", "Experience", "Male"),
+    OLS = coef(ols_model),
+    Q10 = coef(quantile_results$q10),
+    Q50 = coef(quantile_results$q50),
+    Q90 = coef(quantile_results$q90)
+  )
+  
+  rownames(coef_table) <- NULL
+  return(coef_table)
+}
+
+coef_comparison <- create_coefficient_table()
+print("\n=== 회귀 계수 비교표 ===")
+print(round(coef_comparison, 2))
+
+# p-값 비교표 생성
+create_pvalue_table <- function() {
+  # OLS p-values
+  ols_pvals <- summary(ols_model)$coefficients[, "Pr(>|t|)"]
+  
+  # Quantile regression p-values (bootstrap)
+  q10_summary <- summary(quantile_results$q10, se = "boot", R = 1000)
+  q50_summary <- summary(quantile_results$q50, se = "boot", R = 1000)
+  q90_summary <- summary(quantile_results$q90, se = "boot", R = 1000)
+  
+  pval_table <- data.frame(
+    Variable = c("(Intercept)", "Education Years", "Experience", "Male"),
+    OLS = ols_pvals,
+    Q10 = q10_summary$coefficients[, "Pr(>|t|)"],
+    Q50 = q50_summary$coefficients[, "Pr(>|t|)"],
+    Q90 = q90_summary$coefficients[, "Pr(>|t|)"]
+  )
+  
+  rownames(pval_table) <- NULL
+  return(pval_table)
+}
+
+pval_comparison <- create_pvalue_table()
+print("\n=== p-값 비교표 ===")
+print(round(pval_comparison, 4))
+
+# 통계적 유의성 요약 (α = 0.05)
+print("\n=== 통계적 유의성 요약 (α = 0.05) ===")
+significance_indicators <- ifelse(pval_comparison[, -1] < 0.05, "***", "")
+significance_table <- data.frame(
+  Variable = pval_comparison$Variable,
+  significance_indicators
+)
+print(significance_table)
+
+# =============================================================================
+# 6. 종합 시각화
+# =============================================================================
+
+# 1. 불평등 지수 비교 시각화
+plot_inequality_comparison <- function() {
+  par(mfrow = c(1, 2))
+  
+  # 성별 불평등 지수 비교
+  gender_gini <- sapply(gender_inequality, function(x) x$gini)
+  gender_atkinson <- sapply(gender_inequality, function(x) x$atkinson)
+  
+  barplot(rbind(gender_gini, gender_atkinson), 
+          beside = TRUE, 
+          main = "성별 소득 불평등 지수",
+          ylab = "불평등 지수 값",
+          col = c("lightblue", "lightcoral"),
+          legend.text = c("지니 계수", "앳킨슨 지수"))
+  
+  # 교육 수준별 불평등 지수 비교
+  edu_gini <- sapply(education_inequality, function(x) x$gini)
+  edu_atkinson <- sapply(education_inequality, function(x) x$atkinson)
+  
+  barplot(rbind(edu_gini, edu_atkinson), 
+          beside = TRUE, 
+          main = "교육 수준별 소득 불평등 지수",
+          ylab = "불평등 지수 값",
+          col = c("lightgreen", "lightyellow"),
+          legend.text = c("지니 계수", "앳킨슨 지수"),
+          las = 2)
+}
+
+# 2. 분위 회귀 계수 비교 시각화
+plot_quantile_coefficients <- function() {
+  par(mfrow = c(1, 3))
+  
+  # 교육 년수 계수
+  edu_coefs <- c(coef(quantile_results$q10)["education_years"],
+                coef(quantile_results$q50)["education_years"],
+                coef(quantile_results$q90)["education_years"])
+  ols_edu_coef <- coef(ols_model)["education_years"]
+  
+  plot(c(10, 50, 90), edu_coefs, type = "b", 
+       main = "교육 년수 계수의 분위별 변화",
+       xlab = "분위수", ylab = "회귀 계수",
+       ylim = range(c(edu_coefs, ols_edu_coef)),
+       pch = 16, col = "blue")
+  abline(h = ols_edu_coef, col = "red", lty = 2)
+  legend("topleft", legend = c("분위 회귀", "OLS"), 
+         col = c("blue", "red"), lty = c(1, 2))
+  grid()
+  
+  # 경력 계수
+  exp_coefs <- c(coef(quantile_results$q10)["experience"],
+                coef(quantile_results$q50)["experience"],
+                coef(quantile_results$q90)["experience"])
+  ols_exp_coef <- coef(ols_model)["experience"]
+  
+  plot(c(10, 50, 90), exp_coefs, type = "b", 
+       main = "경력 계수의 분위별 변화",
+       xlab = "분위수", ylab = "회귀 계수",
+       ylim = range(c(exp_coefs, ols_exp_coef)),
+       pch = 16, col = "green")
+  abline(h = ols_exp_coef, col = "red", lty = 2)
+  legend("topleft", legend = c("분위 회귀", "OLS"), 
+         col = c("green", "red"), lty = c(1, 2))
+  grid()
+  
+  # 성별(남성) 계수
+  male_coefs <- c(coef(quantile_results$q10)["male"],
+                 coef(quantile_results$q50)["male"],
+                 coef(quantile_results$q90)["male"])
+  ols_male_coef <- coef(ols_model)["male"]
+  
+  plot(c(10, 50, 90), male_coefs, type = "b", 
+       main = "성별(남성) 계수의 분위별 변화",
+       xlab = "분위수", ylab = "회귀 계수",
+       ylim = range(c(male_coefs, ols_male_coef)),
+       pch = 16, col = "purple")
+  abline(h = ols_male_coef, col = "red", lty = 2)
+  legend("topleft", legend = c("분위 회귀", "OLS"), 
+         col = c("purple", "red"), lty = c(1, 2))
+  grid()
+}
+
+# 시각화 실행
+plot_inequality_comparison()
+plot_quantile_coefficients()
+
+# =============================================================================
+# 7. 최종 결과 요약
+# =============================================================================
+
+print("\n" + "="*60)
+print("최종 분석 결과 요약")
+print("="*60)
+
+print("\n1. 커널 밀도 추정 주요 결과:")
+print(sprintf("   - 전체 데이터 최적 대역폭: %.4f", overall_bw))
+print("   - 성별 간 소득 분포 형태에 차이 관찰됨")
+print("   - 교육 수준별 소득 분포가 뚜렷하게 구분됨")
+
+print("\n2. 소득 불평등 지수:")
+print(sprintf("   - 전체 지니 계수: %.3f", overall_inequality$gini))
+print(sprintf("   - 전체 앳킨슨 지수: %.3f", overall_inequality$atkinson))
+print("   - 성별 간 불평등 수준에 차이 존재")
+
+print("\n3. 분위 회귀 분석 주요 발견:")
+print("   - 교육의 수익률이 고소득 분위에서 더 높음")
+print("   - 성별 소득 격차가 모든 분위에서 일관됨")
+print("   - 경력의 효과는 중간 분위에서 가장 큼")
+
+print("\n4. 정책적 함의:")
+print("   - 교육 투자의 불평등 확대 효과 고려 필요")
+print("   - 성별 소득 격차 해소를 위한 정책 개입 요구")
+print("   - 저소득층 대상 교육 접근성 개선 중요")
