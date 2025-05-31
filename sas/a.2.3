@@ -1,0 +1,135 @@
+/* 1. 데이터 준비 */
+data wine_data;
+    call streaminit(42);
+    do i = 1 to 6497;
+        fixed_acidity = rand('normal', 8.32, 1.74);
+        volatile_acidity = rand('gamma', 2) / 10;
+        citric_acid = rand('beta', 2, 8);
+        residual_sugar = rand('exponential') * 2.5;
+        chlorides = rand('gamma', 3) / 100;
+        free_sulfur_dioxide = rand('gamma', 2) * 15;
+        total_sulfur_dioxide = rand('normal', 46, 32);
+        density = rand('normal', 0.9967, 0.0019);
+        pH = rand('normal', 3.31, 0.15);
+        sulphates = rand('gamma', 4) * 0.15;
+        alcohol = rand('normal', 10.4, 1.07);
+        
+        /* 품질 등급 생성 */
+        u = rand('uniform');
+        if u < 0.01 then quality = 3;
+        else if u < 0.06 then quality = 4;
+        else if u < 0.48 then quality = 5;
+        else if u < 0.88 then quality = 6;
+        else if u < 0.99 then quality = 7;
+        else if u < 1.00 then quality = 8;
+        else quality = 9;
+        
+        output;
+    end;
+    drop i u;
+run;
+
+/* 변수 표준화 */
+proc standard data=wine_data out=wine_std mean=0 std=1;
+    var fixed_acidity volatile_acidity citric_acid residual_sugar chlorides
+        free_sulfur_dioxide total_sulfur_dioxide density pH sulphates alcohol;
+run;
+
+/* 2. 베이지안 회귀 모델 (약하게 정보적 사전분포) */
+proc mcmc data=wine_std outpost=posterior_weak nmc=10000 thin=2 seed=42;
+    /* 사전분포 설정 */
+    parms beta0 0;
+    parms (beta1-beta11) 0;
+    parms sigma2 1;
+    
+    /* 약하게 정보적 사전분포 */
+    prior beta0 ~ normal(mean=0, var=1);
+    prior beta1 beta2 beta3 beta4 beta5 beta6 beta7 beta8 beta9 beta10 beta11 
+          ~ normal(mean=0, var=1);
+    prior sigma2 ~ igamma(shape=2, scale=1);
+    
+    /* 가능도 함수 */
+    mu = beta0 + beta1*fixed_acidity + beta2*volatile_acidity + beta3*citric_acid +
+         beta4*residual_sugar + beta5*chlorides + beta6*free_sulfur_dioxide +
+         beta7*total_sulfur_dioxide + beta8*density + beta9*pH + 
+         beta10*sulphates + beta11*alcohol;
+    
+    model quality ~ normal(mu, var=sigma2);
+run;
+
+/* 3. 베이지안 회귀 모델 (비정보적 사전분포) */
+proc mcmc data=wine_std outpost=posterior_flat nmc=10000 thin=2 seed=42;
+    /* 사전분포 설정 */
+    parms beta0 0;
+    parms (beta1-beta11) 0;
+    parms sigma2 1;
+    
+    /* 비정보적 사전분포 */
+    prior beta0 ~ normal(mean=0, var=10000);
+    prior beta1 beta2 beta3 beta4 beta5 beta6 beta7 beta8 beta9 beta10 beta11 
+          ~ normal(mean=0, var=10000);
+    prior sigma2 ~ igamma(shape=0.01, scale=0.01);
+    
+    /* 가능도 함수 */
+    mu = beta0 + beta1*fixed_acidity + beta2*volatile_acidity + beta3*citric_acid +
+         beta4*residual_sugar + beta5*chlorides + beta6*free_sulfur_dioxide +
+         beta7*total_sulfur_dioxide + beta8*density + beta9*pH + 
+         beta10*sulphates + beta11*alcohol;
+    
+    model quality ~ normal(mu, var=sigma2);
+run;
+
+/* 4. 사후 분포 요약 통계 */
+proc means data=posterior_weak mean std p2.5 p97.5;
+    var beta1-beta11;
+    title "약하게 정보적 사전분포 - 사후 분포 요약";
+run;
+
+proc means data=posterior_flat mean std p2.5 p97.5;
+    var beta1-beta11;
+    title "비정보적 사전분포 - 사후 분포 요약";
+run;
+
+/* 5. 사전분포 민감도 비교 */
+data comparison;
+    merge 
+        (select mean as weak_mean, std as weak_std, p2_5 as weak_ci_low, 
+                p97_5 as weak_ci_high from posterior_weak(obs=1))
+        (select mean as flat_mean, std as flat_std, p2_5 as flat_ci_low, 
+                p97_5 as flat_ci_high from posterior_flat(obs=1));
+    
+    mean_diff = abs(weak_mean - flat_mean);
+run;
+
+/* 6. 상호작용 모델 */
+proc mcmc data=wine_std outpost=posterior_interaction nmc=10000 thin=2 seed=42;
+    parms beta0 0;
+    parms (beta1-beta11) 0;
+    parms interaction1 0; /* alcohol * volatile_acidity */
+    parms sigma2 1;
+    
+    prior beta0 ~ normal(mean=0, var=1);
+    prior beta1 beta2 beta3 beta4 beta5 beta6 beta7 beta8 beta9 beta10 beta11 
+          ~ normal(mean=0, var=1);
+    prior interaction1 ~ normal(mean=0, var=1);
+    prior sigma2 ~ igamma(shape=2, scale=1);
+    
+    mu = beta0 + beta1*fixed_acidity + beta2*volatile_acidity + beta3*citric_acid +
+         beta4*residual_sugar + beta5*chlorides + beta6*free_sulfur_dioxide +
+         beta7*total_sulfur_dioxide + beta8*density + beta9*pH + 
+         beta10*sulphates + beta11*alcohol + 
+         interaction1*alcohol*volatile_acidity;
+    
+    model quality ~ normal(mu, var=sigma2);
+run;
+
+/* 7. 시각화를 위한 데이터 준비 */
+proc transpose data=posterior_weak out=beta_values_weak;
+    var beta1-beta11;
+run;
+
+proc sgplot data=beta_values_weak;
+    histogram col1;
+    density col1;
+    title "Beta 계수 사후 분포 (약하게 정보적 사전분포)";
+run;
